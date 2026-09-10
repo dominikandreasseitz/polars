@@ -481,6 +481,22 @@ fn func_args_to_fields(input: &[ExprIR], ctx: &ToFieldContext) -> PolarsResult<V
         .collect()
 }
 
+/// Output dtype of `struct <arithmetic> numeric`: every field is widened to the
+/// shared supertype of itself, the other fields and `numeric`, mirroring the
+/// coercion in `process_struct_numeric_arithmetic`.
+#[cfg(feature = "dtype-struct")]
+fn struct_numeric_arithmetic_dtype(fields: &[Field], numeric: &DataType) -> PolarsResult<DataType> {
+    let st = fields
+        .iter()
+        .try_fold(numeric.clone(), |st, f| try_get_supertype(&st, &f.dtype))?;
+    Ok(DataType::Struct(
+        fields
+            .iter()
+            .map(|f| Field::new(f.name.clone(), st.clone()))
+            .collect(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_arithmetic_field(
     left: Node,
@@ -510,9 +526,11 @@ fn get_arithmetic_field(
                 (Struct(_), Struct(_)) => {
                     return Ok(left_field);
                 },
-                // This matches the engine output. TODO: revisit pending resolution of GH issue #23797
+                // Fields and the numeric operand widen to their shared supertype (GH #23797).
                 #[cfg(feature = "dtype-struct")]
-                (Struct(_), r) if r.is_numeric() => {
+                (Struct(fields), r) if r.is_numeric() => {
+                    let dtype = struct_numeric_arithmetic_dtype(fields, r)?;
+                    left_field.set_dtype(dtype);
                     return Ok(left_field);
                 },
                 (Duration(_), Datetime(_, _))
@@ -581,9 +599,11 @@ fn get_arithmetic_field(
                 (Struct(_), Struct(_)) => {
                     return Ok(left_field);
                 },
-                // This matches the engine output. TODO: revisit pending resolution of GH issue #23797
+                // Fields and the numeric operand widen to their shared supertype (GH #23797).
                 #[cfg(feature = "dtype-struct")]
-                (Struct(_), r) if r.is_numeric() => {
+                (Struct(fields), r) if r.is_numeric() => {
+                    let dtype = struct_numeric_arithmetic_dtype(fields, r)?;
+                    left_field.set_dtype(dtype);
                     return Ok(left_field);
                 },
                 (Duration(_), Datetime(_, _))
@@ -655,9 +675,11 @@ fn get_arithmetic_field(
                 (Struct(_), Struct(_)) => {
                     return Ok(left_field);
                 },
-                // This matches the engine output. TODO: revisit pending resolution of GH issue #23797
+                // Fields and the numeric operand widen to their shared supertype (GH #23797).
                 #[cfg(feature = "dtype-struct")]
-                (Struct(_), r) if r.is_numeric() => {
+                (Struct(fields), r) if r.is_numeric() => {
+                    let dtype = struct_numeric_arithmetic_dtype(fields, r)?;
+                    left_field.set_dtype(dtype);
                     return Ok(left_field);
                 },
                 (Datetime(_, _), _)

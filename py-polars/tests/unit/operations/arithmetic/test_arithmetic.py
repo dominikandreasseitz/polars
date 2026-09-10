@@ -200,6 +200,32 @@ def test_struct_arithmetic() -> None:
     ).to_dict(as_series=False) == {"cum_sum": [{"a": 3, "c": 18}, {"a": 6, "c": 24}]}
 
 
+def test_struct_numeric_arithmetic_supertype_23797() -> None:
+    # A struct field widens to the supertype of itself and the numeric operand,
+    # the same way list / array arithmetic does. Previously the operand was cast
+    # down to the field dtype, so `+ 1.5` truncated to `+ 1` and stayed Int64.
+    # The lazy schema must match the collected output (autouse fixture checks it).
+    for op, val, expected in [
+        (operator.add, 1.5, {"a": 4.5, "b": 5.5}),
+        (operator.sub, 1.5, {"a": 1.5, "b": 2.5}),
+        (operator.mul, 2, {"a": 6, "b": 8}),
+        (operator.floordiv, 2, {"a": 1, "b": 2}),
+    ]:
+        lf = pl.LazyFrame({"a": [3], "b": [4]}).select(
+            op(pl.struct("a", "b"), val).alias("s")
+        )
+        assert lf.collect().to_dict(as_series=False) == {"s": [expected]}
+
+    # widening only kicks in when the operand is wider than the field
+    noop = pl.LazyFrame({"a": [3]}).select(pl.struct("a") + 2)
+    assert noop.collect_schema() == pl.Schema({"a": pl.Struct({"a": pl.Int64})})
+
+    widened = pl.LazyFrame(schema={"a": pl.Int8}).select(
+        (pl.struct("a") + pl.lit(1, pl.Int64)).alias("a")
+    )
+    assert widened.collect_schema() == pl.Schema({"a": pl.Struct({"a": pl.Int64})})
+
+
 def test_simd_float_sum_determinism() -> None:
     out = []
     for _ in range(10):
