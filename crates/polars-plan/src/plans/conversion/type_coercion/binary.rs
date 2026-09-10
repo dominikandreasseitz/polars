@@ -49,8 +49,13 @@ fn is_cat_str_binary(type_left: &DataType, type_right: &DataType) -> bool {
 }
 
 #[cfg(feature = "dtype-struct")]
-// Ensure we don't cast to supertype
-// otherwise we will fill a struct with null fields
+// Numeric arithmetic against a struct widens every field and the numeric operand
+// to their shared supertype (like list / array arithmetic coercing to one leaf
+// supertype), then wraps the numeric operand in a single-field struct for the
+// struct<>struct arithmetic to broadcast. Both sides are cast: the struct<>struct
+// kernels require matching field dtypes (floor-division panics otherwise), and it
+// keeps the resolved schema in sync with the output. Casting the numeric value
+// straight to the struct dtype is still avoided - that null-fills the struct.
 fn process_struct_numeric_arithmetic(
     type_left: DataType,
     type_right: DataType,
@@ -59,42 +64,42 @@ fn process_struct_numeric_arithmetic(
     op: Operator,
     expr_arena: &mut Arena<AExpr>,
 ) -> PolarsResult<Option<AExpr>> {
-    match (&type_left, &type_right) {
-        (DataType::Struct(fields), _) => {
-            if let Some(first) = fields.first() {
-                let new_node_right = expr_arena.add(AExpr::Cast {
-                    expr: node_right,
-                    dtype: DataType::Struct(vec![first.clone()]),
-                    options: CastOptions::NonStrict,
-                });
-                Ok(Some(AExpr::BinaryExpr {
-                    left: node_left,
-                    op,
-                    right: new_node_right,
-                }))
-            } else {
-                Ok(None)
-            }
-        },
-        (_, DataType::Struct(fields)) => {
-            if let Some(first) = fields.first() {
-                let new_node_left = expr_arena.add(AExpr::Cast {
-                    expr: node_left,
-                    dtype: DataType::Struct(vec![first.clone()]),
-                    options: CastOptions::NonStrict,
-                });
-
-                Ok(Some(AExpr::BinaryExpr {
-                    left: new_node_left,
-                    op,
-                    right: node_right,
-                }))
-            } else {
-                Ok(None)
-            }
-        },
+    let (fields, numeric, struct_left) = match (&type_left, &type_right) {
+        (DataType::Struct(fields), numeric) => (fields, numeric, true),
+        (numeric, DataType::Struct(fields)) => (fields, numeric, false),
         _ => unreachable!(),
-    }
+    };
+    let Some(first) = fields.first() else {
+        return Ok(None);
+    };
+
+    let st = fields
+        .iter()
+        .try_fold(numeric.clone(), |st, f| get_supertype(&st, &f.dtype));
+    let st = unpack!(st);
+
+    let struct_cast = expr_arena.add(AExpr::Cast {
+        expr: if struct_left { node_left } else { node_right },
+        dtype: DataType::Struct(
+            fields
+                .iter()
+                .map(|f| Field::new(f.name.clone(), st.clone()))
+                .collect(),
+        ),
+        options: CastOptions::NonStrict,
+    });
+    let numeric_cast = expr_arena.add(AExpr::Cast {
+        expr: if struct_left { node_right } else { node_left },
+        dtype: DataType::Struct(vec![Field::new(first.name.clone(), st)]),
+        options: CastOptions::NonStrict,
+    });
+
+    let (left, right) = if struct_left {
+        (struct_cast, numeric_cast)
+    } else {
+        (numeric_cast, struct_cast)
+    };
+    Ok(Some(AExpr::BinaryExpr { left, op, right }))
 }
 
 fn process_list_numeric_arithmetic(
