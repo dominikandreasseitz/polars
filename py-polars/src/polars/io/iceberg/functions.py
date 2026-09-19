@@ -114,8 +114,9 @@ def scan_iceberg(
     row_filter
         A PyIceberg `BooleanExpression <https://py.iceberg.apache.org/api/#row-filtering>`__
         applied directly to the table scan, ANDed with any filter derived from
-        the query. Forces the PyIceberg reader; combining this with
-        `reader_override="native"` raises `ValueError`.
+        the query. Requires `reader_override="pyiceberg"`; raises `ValueError`
+        otherwise, since the native reader only uses this for file-level
+        pruning, not row-level filtering.
 
         .. warning::
             This functionality is considered **unstable**. It may be changed
@@ -223,16 +224,13 @@ def scan_iceberg(
         )
         raise ValueError(msg)
 
-    resolved_reader_override = reader_override
-
     if row_filter is not None:
         msg = "the `row_filter` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
 
-        if reader_override == "native":
-            msg = "`row_filter` is not supported with `reader_override='native'`"
+        if reader_override != "pyiceberg":
+            msg = "`row_filter` requires `reader_override='pyiceberg'`"
             raise ValueError(msg)
-        resolved_reader_override = "pyiceberg"
 
     table: pyiceberg.table.Table | None = None
 
@@ -268,7 +266,7 @@ def scan_iceberg(
         snapshot_id=snapshot_id,
         from_snapshot_id_exclusive=from_snapshot_id_exclusive,
         to_snapshot_id_inclusive=to_snapshot_id_inclusive,
-        reader_override=resolved_reader_override,
+        reader_override=reader_override,
         use_metadata_statistics=use_metadata_statistics,
         fast_deletion_count=fast_deletion_count,
         use_pyiceberg_filter=use_pyiceberg_filter,

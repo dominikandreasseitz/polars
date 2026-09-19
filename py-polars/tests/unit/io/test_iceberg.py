@@ -348,7 +348,9 @@ class TestIcebergScanIO:
         assert math.isnan(value)
 
     def test_scan_iceberg_row_filter(self, iceberg_path: str) -> None:
-        lf = pl.scan_iceberg(iceberg_path, row_filter=GreaterThan("id", 1))
+        lf = pl.scan_iceberg(
+            iceberg_path, row_filter=GreaterThan("id", 1), reader_override="pyiceberg"
+        )
         assert lf.collect().rows() == [
             (2, "2", datetime(2023, 3, 1, 19, 25)),
             (3, "3", datetime(2023, 3, 2, 22, 0)),
@@ -363,18 +365,21 @@ class TestIcebergScanIO:
         res = lf.select("str")
         assert res.collect().rows() == [("2",), ("3",)]
 
-        empty = pl.scan_iceberg(iceberg_path, row_filter=AlwaysFalse())
+        empty = pl.scan_iceberg(
+            iceberg_path, row_filter=AlwaysFalse(), reader_override="pyiceberg"
+        )
         assert empty.collect().rows() == []
         assert empty.select(pl.len()).collect().item() == 0
 
+    @pytest.mark.parametrize("reader_override", [None, "native"])
     def test_scan_iceberg_row_filter_requires_pyiceberg_reader(
-        self, iceberg_path: str
+        self, iceberg_path: str, reader_override: Literal["native"] | None
     ) -> None:
         with pytest.raises(ValueError, match="row_filter"):
             pl.scan_iceberg(
                 iceberg_path,
                 row_filter=GreaterThan("id", 1),
-                reader_override="native",
+                reader_override=reader_override,
             )
 
     def test_scan_iceberg_filter_is_in_empty(self, tmp_path: Path) -> None:
