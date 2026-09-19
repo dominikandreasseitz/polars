@@ -39,7 +39,7 @@ def scan_iceberg(
     use_metadata_statistics: bool = True,
     fast_deletion_count: bool | None = None,
     use_pyiceberg_filter: bool = True,
-    rows_filter: pyiceberg.expressions.BooleanExpression | None = None,
+    row_filter: pyiceberg.expressions.BooleanExpression | None = None,
 ) -> LazyFrame:
     """
     Lazily read from an Apache Iceberg table.
@@ -110,13 +110,30 @@ def scan_iceberg(
             This functionality is considered **unstable**. It may be changed
             at any point without it being considered a breaking change.
     use_pyiceberg_filter
-        Convert and push the filter to PyIceberg where possible.
-    rows_filter
-        A PyIceberg `BooleanExpression` to apply directly to the table scan,
-        bypassing the polars-to-PyIceberg predicate conversion. This is useful
-        if you already have a PyIceberg filter expression on hand. It is
-        combined with (ANDed to) any filter derived from `.filter()` calls
-        on the returned `LazyFrame`.
+        Convert and push the filter to PyIceberg where possible. This does not
+        affect `row_filter`, which is always applied regardless of this
+        setting.
+    row_filter
+        A PyIceberg ``BooleanExpression`` (see `pyiceberg.expressions
+        <https://py.iceberg.apache.org/api/#row-filtering>`__) to apply
+        directly to the table scan, bypassing the polars-to-PyIceberg
+        predicate conversion. This is useful if you already have a PyIceberg
+        filter expression on hand, or one that cannot be expressed through
+        polars' predicate pushdown. It is combined with (ANDed to) any filter
+        derived from `.filter()` calls on the returned `LazyFrame`.
+
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
+
+        Setting this forces the PyIceberg reader (as if
+        `reader_override="pyiceberg"` were passed), since the native reader
+        only uses PyIceberg filters for file-level pruning rather than
+        row-level filtering. This means the native reader's other
+        optimizations (metadata statistics pushdown, fast row counts, native
+        deletion vector handling) are not available while `row_filter` is
+        set. Combining `row_filter` with `reader_override="native"` raises
+        `ValueError`.
 
     Returns
     -------
@@ -205,15 +222,6 @@ def scan_iceberg(
         msg = "the `reader_override` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
 
-    if rows_filter is not None:
-        # The native reader only uses the PyIceberg filter for file-level
-        # pruning, not for row-level filtering, so `rows_filter` cannot be
-        # honored correctly there. The PyIceberg reader applies it properly.
-        if reader_override == "native":
-            msg = "`rows_filter` is not supported together with `reader_override='native'`"
-            raise ValueError(msg)
-        reader_override = "pyiceberg"
-
     if fast_deletion_count is not None:
         msg = "the `fast_deletion_count` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
@@ -228,6 +236,29 @@ def scan_iceberg(
             "or `to_snapshot_id_inclusive`"
         )
         raise ValueError(msg)
+
+    resolved_reader_override = reader_override
+
+    if row_filter is not None:
+        msg = "the `row_filter` parameter of `scan_iceberg()` is considered unstable."
+        issue_unstable_warning(msg)
+
+        # The native reader only uses the PyIceberg filter for file-level
+        # pruning, not for row-level filtering, so `row_filter` cannot be
+        # honored correctly there. The PyIceberg reader applies it properly,
+        # at the cost of forgoing the native reader's other optimizations
+        # (metadata statistics pushdown, fast row counts, native deletion
+        # vector handling).
+        if reader_override == "native":
+            msg = (
+                "`row_filter` is not supported together with `reader_override='native'`, "
+                "since the native reader only uses PyIceberg filters for file-level "
+                "pruning, not row-level filtering; either drop `reader_override` to let "
+                "`row_filter` select the PyIceberg reader automatically, or express the "
+                "condition as a `.filter()` call on the returned `LazyFrame` instead"
+            )
+            raise ValueError(msg)
+        resolved_reader_override = "pyiceberg"
 
     table: pyiceberg.table.Table | None = None
 
@@ -263,11 +294,11 @@ def scan_iceberg(
         snapshot_id=snapshot_id,
         from_snapshot_id_exclusive=from_snapshot_id_exclusive,
         to_snapshot_id_inclusive=to_snapshot_id_inclusive,
-        reader_override=reader_override,
+        reader_override=resolved_reader_override,
         use_metadata_statistics=use_metadata_statistics,
         fast_deletion_count=fast_deletion_count,
         use_pyiceberg_filter=use_pyiceberg_filter,
-        rows_filter=rows_filter,
+        row_filter=row_filter,
     )
 
     return wrap_ldf(PyLazyFrame.new_from_dataset_object(dataset))

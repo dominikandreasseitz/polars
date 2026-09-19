@@ -217,7 +217,7 @@ class IcebergScanResolver:
     use_metadata_statistics: bool
     fast_deletion_count: bool
     use_pyiceberg_filter: bool
-    rows_filter: pyiceberg.expressions.BooleanExpression | None
+    row_filter: pyiceberg.expressions.BooleanExpression | None
 
     #
     # PythonDatasetProvider interface functions
@@ -293,13 +293,13 @@ class IcebergScanResolver:
         ):
             iceberg_table_filter = try_convert_pyarrow_predicate(pyarrow_predicate)
 
-        if self.rows_filter is not None:
+        if self.row_filter is not None:
             import pyiceberg.expressions
 
             iceberg_table_filter = (
-                self.rows_filter
+                self.row_filter
                 if iceberg_table_filter is None
-                else pyiceberg.expressions.And(self.rows_filter, iceberg_table_filter)
+                else pyiceberg.expressions.And(self.row_filter, iceberg_table_filter)
             )
 
         if verbose:
@@ -402,6 +402,17 @@ class IcebergScanResolver:
             msg = (
                 "iceberg: unknown value for reader_override: "
                 f"'{reader_override}', expected one of ('native', 'pyiceberg')"
+            )
+            raise ValueError(msg)
+
+        if self.row_filter is not None and reader_override != "pyiceberg":
+            # Defense in depth: `scan_iceberg()` should already have forced
+            # `reader_override="pyiceberg"` (or raised) whenever `row_filter`
+            # is set, since the native reader only uses the PyIceberg filter
+            # for file-level pruning, not row-level filtering.
+            msg = (
+                "iceberg: `row_filter` requires reader_override='pyiceberg' "
+                f"for correct row-level filtering, got: {reader_override!r}"
             )
             raise ValueError(msg)
 

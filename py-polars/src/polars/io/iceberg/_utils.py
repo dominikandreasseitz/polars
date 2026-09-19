@@ -139,10 +139,12 @@ def _scan_pyarrow_dataset_impl(
 
     if with_columns is not None:
         if not with_columns:
-            assert iceberg_table_filter is None
+            count_scan = (
+                scan if iceberg_table_filter is None else scan.filter(iceberg_table_filter)
+            )
 
             def gen() -> Iterable[pl.DataFrame]:
-                remaining = scan.count()
+                remaining = count_scan.count()
 
                 if n_rows is not None:
                     remaining = min(remaining, n_rows)
