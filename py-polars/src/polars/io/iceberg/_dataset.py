@@ -406,10 +406,7 @@ class IcebergScanResolver:
             raise ValueError(msg)
 
         if self.row_filter is not None and reader_override != "pyiceberg":
-            # Defense in depth: `scan_iceberg()` should already have forced
-            # `reader_override="pyiceberg"` (or raised) whenever `row_filter`
-            # is set, since the native reader only uses the PyIceberg filter
-            # for file-level pruning, not row-level filtering.
+            # Defense in depth - `scan_iceberg()` should already enforce this.
             msg = (
                 "iceberg: `row_filter` requires reader_override='pyiceberg' "
                 f"for correct row-level filtering, got: {reader_override!r}"

@@ -114,7 +114,7 @@ def scan_iceberg(
         affect `row_filter`, which is always applied regardless of this
         setting.
     row_filter
-        A PyIceberg ``BooleanExpression`` (see `pyiceberg.expressions
+        A PyIceberg `BooleanExpression` (see `pyiceberg.expressions
         <https://py.iceberg.apache.org/api/#row-filtering>`__) to apply
         directly to the table scan, bypassing the polars-to-PyIceberg
         predicate conversion. This is useful if you already have a PyIceberg
@@ -243,12 +243,6 @@ def scan_iceberg(
         msg = "the `row_filter` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
 
-        # The native reader only uses the PyIceberg filter for file-level
-        # pruning, not for row-level filtering, so `row_filter` cannot be
-        # honored correctly there. The PyIceberg reader applies it properly,
-        # at the cost of forgoing the native reader's other optimizations
-        # (metadata statistics pushdown, fast row counts, native deletion
-        # vector handling).
         if reader_override == "native":
             msg = (
                 "`row_filter` is not supported together with `reader_override='native'`, "
