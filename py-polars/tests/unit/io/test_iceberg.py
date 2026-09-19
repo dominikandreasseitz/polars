@@ -371,7 +371,7 @@ class TestIcebergScanIO:
 
     def test_scan_iceberg_row_filter_len(self, iceberg_path: str) -> None:
         # `select(pl.len())` takes a fast metadata-only count path that must
-        # still honor `row_filter` (see #<PR_NUMBER>).
+        # still honor `row_filter` (see dominikandreasseitz/polars#2).
         lf = pl.scan_iceberg(iceberg_path, row_filter=GreaterThan("id", 1))
         assert lf.select(pl.len()).collect().item() == 2
         assert lf.collect().height == 2
