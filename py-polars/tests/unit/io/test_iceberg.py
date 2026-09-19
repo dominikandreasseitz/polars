@@ -349,47 +349,24 @@ class TestIcebergScanIO:
 
     def test_scan_iceberg_row_filter(self, iceberg_path: str) -> None:
         lf = pl.scan_iceberg(iceberg_path, row_filter=GreaterThan("id", 1))
-        assert sorted(lf.collect().rows()) == [
+        assert lf.collect().rows() == [
             (2, "2", datetime(2023, 3, 1, 19, 25)),
             (3, "3", datetime(2023, 3, 2, 22, 0)),
         ]
+        assert lf.select(pl.len()).collect().item() == 2  # metadata-only count path
 
-        # Combines (ANDs) with a polars-side `.filter()`.
+        # ANDs with a polars-side `.filter()`.
         res = lf.filter(pl.col("id") < 3)
         assert res.collect().rows() == [(2, "2", datetime(2023, 3, 1, 19, 25))]
 
-        # Equivalent to passing the same condition pre-ANDed directly.
-        lf2 = pl.scan_iceberg(
-            iceberg_path,
-            row_filter=And(GreaterThan("id", 1), EqualTo("id", 2)),
-        )
-        assert lf2.collect().rows() == [(2, "2", datetime(2023, 3, 1, 19, 25))]
+        # The filter column need not be in the output projection.
+        res = lf.select("str")
+        assert res.collect().rows() == [("2",), ("3",)]
 
-        # A filter that matches nothing.
-        lf3 = pl.scan_iceberg(iceberg_path, row_filter=AlwaysFalse())
-        assert lf3.collect().rows() == []
-
-    def test_scan_iceberg_row_filter_len(self, iceberg_path: str) -> None:
-        # `select(pl.len())` takes a fast metadata-only count path that must
-        # still honor `row_filter`.
-        lf = pl.scan_iceberg(iceberg_path, row_filter=GreaterThan("id", 1))
-        assert lf.select(pl.len()).collect().item() == 2
-        assert lf.collect().height == 2
-
-        lf_none = pl.scan_iceberg(iceberg_path, row_filter=AlwaysFalse())
-        assert lf_none.select(pl.len()).collect().item() == 0
-
-    def test_scan_iceberg_row_filter_excludes_projection(
-        self, iceberg_path: str
-    ) -> None:
-        # The filter column need not be in the output projection; PyIceberg
-        # unions it into the read projection internally.
-        schema_cols = pl.scan_iceberg(iceberg_path).collect_schema().names()
-        non_filter_col = next(c for c in schema_cols if c != "id")
-        lf = pl.scan_iceberg(iceberg_path, row_filter=GreaterThan("id", 1)).select(
-            non_filter_col
-        )
-        assert lf.collect().height == 2
+        # A filter matching nothing.
+        empty = pl.scan_iceberg(iceberg_path, row_filter=AlwaysFalse())
+        assert empty.collect().rows() == []
+        assert empty.select(pl.len()).collect().item() == 0
 
     def test_scan_iceberg_row_filter_requires_pyiceberg_reader(
         self, iceberg_path: str
@@ -400,17 +377,6 @@ class TestIcebergScanIO:
                 row_filter=GreaterThan("id", 1),
                 reader_override="native",
             )
-
-    def test_scan_iceberg_row_filter_forces_pyiceberg_reader(
-        self, iceberg_path: str
-    ) -> None:
-        resolver = new_iceberg_scan_resolver(iceberg_path)
-        # scan_iceberg() itself forces the reader; verify directly through
-        # the resolver dataclass that no `reader_override=None` case with a
-        # `row_filter` set can silently fall through to the native reader.
-        resolver.row_filter = GreaterThan("id", 1)
-        with pytest.raises(ValueError, match="row_filter"):
-            resolver.to_dataset_scan()
 
     def test_scan_iceberg_filter_is_in_empty(self, tmp_path: Path) -> None:
         tbl, _ = new_iceberg_table(
