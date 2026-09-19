@@ -140,7 +140,9 @@ def _scan_pyarrow_dataset_impl(
     if with_columns is not None:
         if not with_columns:
             count_scan = (
-                scan if iceberg_table_filter is None else scan.filter(iceberg_table_filter)
+                scan
+                if iceberg_table_filter is None
+                else scan.filter(iceberg_table_filter)
             )
 
             def gen() -> Iterable[pl.DataFrame]:
