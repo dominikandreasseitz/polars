@@ -110,30 +110,16 @@ def scan_iceberg(
             This functionality is considered **unstable**. It may be changed
             at any point without it being considered a breaking change.
     use_pyiceberg_filter
-        Convert and push the filter to PyIceberg where possible. This does not
-        affect `row_filter`, which is always applied regardless of this
-        setting.
+        Convert and push the filter to PyIceberg where possible.
     row_filter
-        A PyIceberg `BooleanExpression` (see `pyiceberg.expressions
-        <https://py.iceberg.apache.org/api/#row-filtering>`__) to apply
-        directly to the table scan, bypassing the polars-to-PyIceberg
-        predicate conversion. This is useful if you already have a PyIceberg
-        filter expression on hand, or one that cannot be expressed through
-        polars' predicate pushdown. It is combined with (ANDed to) any filter
-        derived from `.filter()` calls on the returned `LazyFrame`.
+        A PyIceberg `BooleanExpression <https://py.iceberg.apache.org/api/#row-filtering>`__
+        applied directly to the table scan, ANDed with any filter derived from
+        the query. Forces the PyIceberg reader; combining this with
+        `reader_override="native"` raises `ValueError`.
 
         .. warning::
             This functionality is considered **unstable**. It may be changed
             at any point without it being considered a breaking change.
-
-        Setting this forces the PyIceberg reader (as if
-        `reader_override="pyiceberg"` were passed), since the native reader
-        only uses PyIceberg filters for file-level pruning rather than
-        row-level filtering. This means the native reader's other
-        optimizations (metadata statistics pushdown, fast row counts, native
-        deletion vector handling) are not available while `row_filter` is
-        set. Combining `row_filter` with `reader_override="native"` raises
-        `ValueError`.
 
     Returns
     -------
@@ -244,13 +230,7 @@ def scan_iceberg(
         issue_unstable_warning(msg)
 
         if reader_override == "native":
-            msg = (
-                "`row_filter` is not supported together with `reader_override='native'`, "
-                "since the native reader only uses PyIceberg filters for file-level "
-                "pruning, not row-level filtering; either drop `reader_override` to let "
-                "`row_filter` select the PyIceberg reader automatically, or express the "
-                "condition as a `.filter()` call on the returned `LazyFrame` instead"
-            )
+            msg = "`row_filter` is not supported with `reader_override='native'`"
             raise ValueError(msg)
         resolved_reader_override = "pyiceberg"
 

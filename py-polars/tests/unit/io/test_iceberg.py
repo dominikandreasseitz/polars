@@ -353,7 +353,7 @@ class TestIcebergScanIO:
             (2, "2", datetime(2023, 3, 1, 19, 25)),
             (3, "3", datetime(2023, 3, 2, 22, 0)),
         ]
-        assert lf.select(pl.len()).collect().item() == 2  # metadata-only count path
+        assert lf.select(pl.len()).collect().item() == 2
 
         # ANDs with a polars-side `.filter()`.
         res = lf.filter(pl.col("id") < 3)
@@ -363,7 +363,6 @@ class TestIcebergScanIO:
         res = lf.select("str")
         assert res.collect().rows() == [("2",), ("3",)]
 
-        # A filter matching nothing.
         empty = pl.scan_iceberg(iceberg_path, row_filter=AlwaysFalse())
         assert empty.collect().rows() == []
         assert empty.select(pl.len()).collect().item() == 0
