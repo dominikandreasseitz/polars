@@ -23,6 +23,7 @@ from polars.io.scan_options.cast_options import ScanCastOptions
 if TYPE_CHECKING:
     import pyarrow as pa
     import pyiceberg.catalog
+    import pyiceberg.expressions
     import pyiceberg.schema
     import pyiceberg.table
     import pyiceberg.typedef
@@ -216,6 +217,7 @@ class IcebergScanResolver:
     use_metadata_statistics: bool
     fast_deletion_count: bool
     use_pyiceberg_filter: bool
+    rows_filter: pyiceberg.expressions.BooleanExpression | None
 
     #
     # PythonDatasetProvider interface functions
@@ -290,6 +292,15 @@ class IcebergScanResolver:
             and self.use_pyiceberg_filter
         ):
             iceberg_table_filter = try_convert_pyarrow_predicate(pyarrow_predicate)
+
+        if self.rows_filter is not None:
+            import pyiceberg.expressions
+
+            iceberg_table_filter = (
+                self.rows_filter
+                if iceberg_table_filter is None
+                else pyiceberg.expressions.And(self.rows_filter, iceberg_table_filter)
+            )
 
         if verbose:
             pyarrow_predicate_display = (

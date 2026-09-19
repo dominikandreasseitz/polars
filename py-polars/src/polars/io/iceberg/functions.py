@@ -17,6 +17,7 @@ from polars.io.iceberg._dataset import (
 
 if TYPE_CHECKING:
     import pyiceberg.catalog
+    import pyiceberg.expressions
     import pyiceberg.table
 
     import polars.io.iceberg
@@ -38,6 +39,7 @@ def scan_iceberg(
     use_metadata_statistics: bool = True,
     fast_deletion_count: bool | None = None,
     use_pyiceberg_filter: bool = True,
+    rows_filter: pyiceberg.expressions.BooleanExpression | None = None,
 ) -> LazyFrame:
     """
     Lazily read from an Apache Iceberg table.
@@ -109,6 +111,12 @@ def scan_iceberg(
             at any point without it being considered a breaking change.
     use_pyiceberg_filter
         Convert and push the filter to PyIceberg where possible.
+    rows_filter
+        A PyIceberg `BooleanExpression` to apply directly to the table scan,
+        bypassing the polars-to-PyIceberg predicate conversion. This is useful
+        if you already have a PyIceberg filter expression on hand. It is
+        combined with (ANDed to) any filter derived from `.filter()` calls
+        on the returned `LazyFrame`.
 
     Returns
     -------
@@ -197,6 +205,15 @@ def scan_iceberg(
         msg = "the `reader_override` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
 
+    if rows_filter is not None:
+        # The native reader only uses the PyIceberg filter for file-level
+        # pruning, not for row-level filtering, so `rows_filter` cannot be
+        # honored correctly there. The PyIceberg reader applies it properly.
+        if reader_override == "native":
+            msg = "`rows_filter` is not supported together with `reader_override='native'`"
+            raise ValueError(msg)
+        reader_override = "pyiceberg"
+
     if fast_deletion_count is not None:
         msg = "the `fast_deletion_count` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
@@ -250,6 +267,7 @@ def scan_iceberg(
         use_metadata_statistics=use_metadata_statistics,
         fast_deletion_count=fast_deletion_count,
         use_pyiceberg_filter=use_pyiceberg_filter,
+        rows_filter=rows_filter,
     )
 
     return wrap_ldf(PyLazyFrame.new_from_dataset_object(dataset))

@@ -191,6 +191,7 @@ def new_iceberg_scan_resolver(
         use_metadata_statistics=True,
         fast_deletion_count=False,
         use_pyiceberg_filter=True,
+        rows_filter=None,
     )
 
 
@@ -345,6 +346,26 @@ class TestIcebergScanIO:
             .rows()
         )
         assert math.isnan(value)
+
+    def test_scan_iceberg_rows_filter(self, iceberg_path: str) -> None:
+        from pyiceberg.expressions import And, EqualTo, GreaterThan
+
+        lf = pl.scan_iceberg(iceberg_path, rows_filter=GreaterThan("id", 1))
+        assert lf.collect().rows() == [
+            (2, "2", datetime(2023, 3, 1, 19, 25)),
+            (3, "3", datetime(2023, 3, 2, 22, 0)),
+        ]
+
+        # Combines (ANDs) with a polars-side `.filter()`.
+        res = lf.filter(pl.col("id") < 3)
+        assert res.collect().rows() == [(2, "2", datetime(2023, 3, 1, 19, 25))]
+
+        # Equivalent to passing the same condition pre-ANDed directly.
+        lf2 = pl.scan_iceberg(
+            iceberg_path,
+            rows_filter=And(GreaterThan("id", 1), EqualTo("id", 2)),
+        )
+        assert lf2.collect().rows() == [(2, "2", datetime(2023, 3, 1, 19, 25))]
 
     def test_scan_iceberg_filter_is_in_empty(self, tmp_path: Path) -> None:
         tbl, _ = new_iceberg_table(
