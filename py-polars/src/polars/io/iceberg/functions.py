@@ -113,10 +113,10 @@ def scan_iceberg(
         Convert and push the filter to PyIceberg where possible.
     row_filter
         A PyIceberg `BooleanExpression <https://py.iceberg.apache.org/api/#row-filtering>`__
-        applied directly to the table scan, ANDed with any filter derived from
-        the query. Requires `reader_override="pyiceberg"`; raises `ValueError`
-        otherwise, since the native reader only uses this for file-level
-        pruning, not row-level filtering.
+        applied directly to the table scan, combined with `AND` with any
+        filter derived from the query. Requires `reader_override="pyiceberg"`;
+        raises `ValueError` otherwise, since the native reader only uses this
+        for file-level pruning, not row-level filtering.
 
         .. warning::
             This functionality is considered **unstable**. It may be changed

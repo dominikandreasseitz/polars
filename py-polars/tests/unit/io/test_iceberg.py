@@ -357,7 +357,7 @@ class TestIcebergScanIO:
         ]
         assert lf.select(pl.len()).collect().item() == 2
 
-        # ANDs with a polars-side `.filter()`.
+        # Combined with `AND` with a polars-side `.filter()`.
         res = lf.filter(pl.col("id") < 3)
         assert res.collect().rows() == [(2, "2", datetime(2023, 3, 1, 19, 25))]
 
