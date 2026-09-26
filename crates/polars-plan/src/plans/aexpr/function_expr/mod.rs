@@ -288,6 +288,12 @@ pub enum IRFunctionExpr {
         decimals: u32,
         mode: RoundMode,
     },
+    #[cfg(feature = "dtype-decimal")]
+    DecimalArith {
+        op: DecimalArithOp,
+        scale: usize,
+    },
+    TruncArith(TruncArithOp),
     #[cfg(feature = "round_series")]
     RoundSF {
         digits: i32,
@@ -670,6 +676,12 @@ impl Hash for IRFunctionExpr {
                 decimals.hash(state);
                 mode.hash(state);
             },
+            #[cfg(feature = "dtype-decimal")]
+            DecimalArith { op, scale } => {
+                op.hash(state);
+                scale.hash(state);
+            },
+            TruncArith(op) => op.hash(state),
             #[cfg(feature = "round_series")]
             IRFunctionExpr::RoundSF { digits } => digits.hash(state),
             #[cfg(feature = "round_series")]
@@ -929,6 +941,9 @@ impl Display for IRFunctionExpr {
             },
             #[cfg(feature = "round_series")]
             Round { .. } => "round",
+            #[cfg(feature = "dtype-decimal")]
+            DecimalArith { op, .. } => return Display::fmt(op, f),
+            TruncArith(op) => op.name(),
             #[cfg(feature = "round_series")]
             RoundSF { .. } => "round_sig_figs",
             #[cfg(feature = "round_series")]
@@ -1273,6 +1288,9 @@ impl IRFunctionExpr {
             F::Round { .. } | F::RoundSF { .. } | F::Truncate { .. } | F::Floor | F::Ceil => {
                 FunctionOptions::elementwise()
             },
+            #[cfg(feature = "dtype-decimal")]
+            F::DecimalArith { .. } => FunctionOptions::elementwise(),
+            F::TruncArith(_) => FunctionOptions::elementwise(),
             #[cfg(feature = "fused")]
             F::Fused(_) => FunctionOptions::elementwise(),
             F::ConcatExpr { .. } => FunctionOptions::groupwise()

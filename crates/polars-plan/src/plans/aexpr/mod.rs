@@ -286,6 +286,9 @@ impl AExpr {
                 },
                 #[cfg(feature = "replace")]
                 IRFunctionExpr::ReplaceStrict { .. } => true,
+                #[cfg(feature = "dtype-decimal")]
+                IRFunctionExpr::DecimalArith { .. } => true,
+                IRFunctionExpr::TruncArith(_) => true,
                 #[cfg(all(feature = "strings", feature = "temporal"))]
                 IRFunctionExpr::StringExpr(f) => match f {
                     IRStringFunction::Strptime(_, strptime_options) => {
