@@ -23,6 +23,7 @@ from polars.io.scan_options.cast_options import ScanCastOptions
 if TYPE_CHECKING:
     import pyarrow as pa
     import pyiceberg.catalog
+    import pyiceberg.expressions
     import pyiceberg.schema
     import pyiceberg.table
     import pyiceberg.typedef
@@ -216,6 +217,7 @@ class IcebergScanResolver:
     use_metadata_statistics: bool
     fast_deletion_count: bool
     use_pyiceberg_filter: bool
+    row_filter: pyiceberg.expressions.BooleanExpression | None
 
     #
     # PythonDatasetProvider interface functions
@@ -290,6 +292,15 @@ class IcebergScanResolver:
             and self.use_pyiceberg_filter
         ):
             iceberg_table_filter = try_convert_pyarrow_predicate(pyarrow_predicate)
+
+        if self.row_filter is not None:
+            import pyiceberg.expressions
+
+            iceberg_table_filter = (
+                self.row_filter
+                if iceberg_table_filter is None
+                else pyiceberg.expressions.And(self.row_filter, iceberg_table_filter)
+            )
 
         if verbose:
             pyarrow_predicate_display = (
@@ -391,6 +402,14 @@ class IcebergScanResolver:
             msg = (
                 "iceberg: unknown value for reader_override: "
                 f"'{reader_override}', expected one of ('native', 'pyiceberg')"
+            )
+            raise ValueError(msg)
+
+        if self.row_filter is not None and reader_override != "pyiceberg":
+            # Already enforced in `scan_iceberg()`.
+            msg = (
+                "iceberg: `row_filter` requires reader_override='pyiceberg' "
+                f"for correct row-level filtering, got: {reader_override!r}"
             )
             raise ValueError(msg)
 

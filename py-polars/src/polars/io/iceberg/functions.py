@@ -17,6 +17,7 @@ from polars.io.iceberg._dataset import (
 
 if TYPE_CHECKING:
     import pyiceberg.catalog
+    import pyiceberg.expressions
     import pyiceberg.table
 
     import polars.io.iceberg
@@ -38,6 +39,7 @@ def scan_iceberg(
     use_metadata_statistics: bool = True,
     fast_deletion_count: bool | None = None,
     use_pyiceberg_filter: bool = True,
+    row_filter: pyiceberg.expressions.BooleanExpression | None = None,
 ) -> LazyFrame:
     """
     Lazily read from an Apache Iceberg table.
@@ -109,6 +111,16 @@ def scan_iceberg(
             at any point without it being considered a breaking change.
     use_pyiceberg_filter
         Convert and push the filter to PyIceberg where possible.
+    row_filter
+        A PyIceberg `BooleanExpression <https://py.iceberg.apache.org/api/#row-filtering>`__
+        applied directly to the table scan, combined with `AND` with any
+        filter derived from the query. Requires `reader_override="pyiceberg"`;
+        raises `ValueError` otherwise, since the native reader only uses this
+        for file-level pruning, not row-level filtering.
+
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
     Returns
     -------
@@ -212,6 +224,14 @@ def scan_iceberg(
         )
         raise ValueError(msg)
 
+    if row_filter is not None:
+        msg = "the `row_filter` parameter of `scan_iceberg()` is considered unstable."
+        issue_unstable_warning(msg)
+
+        if reader_override != "pyiceberg":
+            msg = "`row_filter` requires `reader_override='pyiceberg'`"
+            raise ValueError(msg)
+
     table: pyiceberg.table.Table | None = None
 
     if importlib.util.find_spec("pyiceberg.table") is not None:
@@ -250,6 +270,7 @@ def scan_iceberg(
         use_metadata_statistics=use_metadata_statistics,
         fast_deletion_count=fast_deletion_count,
         use_pyiceberg_filter=use_pyiceberg_filter,
+        row_filter=row_filter,
     )
 
     return wrap_ldf(PyLazyFrame.new_from_dataset_object(dataset))
