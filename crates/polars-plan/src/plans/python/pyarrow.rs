@@ -137,6 +137,217 @@ fn series_to_pyarrow_list(s: &Series) -> Option<String> {
     Some(list_repr)
 }
 
+/// Shared decision tree for lowering an `AExpr` predicate to either a
+/// PyArrow-expression source string (consumed by Iceberg's AST walker and by
+/// Delta's `eval`) or a live PyArrow `Expression` object (consumed directly
+/// by `scan_pyarrow_dataset`).
+///
+/// This exists so the two renderers below cannot silently diverge on what
+/// they consider valid to push down: every *tree-shape* decision (which
+/// `AExpr` variants translate, how `is_between`/`is_in`/`starts_with`/
+/// validity-comparisons restructure, which arithmetic is safe) is made
+/// exactly once, here, rather than duplicated across two ~500-line matches.
+///
+/// Literal encoding is deliberately *not* unified: writing source text and
+/// building a live object are irreducibly different tasks, so each renderer
+/// encodes a `LiteralValue` independently.
+///
+/// Not every variant is supported by every renderer. `scan_pyarrow_dataset`
+/// has never covered `ValidityCompare` (`eq_missing`/`ne_missing`) or
+/// `StartsWith` — there's simply been no need to, since those only matter to
+/// Iceberg/Delta. Renderers return `None` for a variant they don't support,
+/// preserving that pre-existing asymmetry rather than papering over it.
+enum PaIr {
+    /// Raw (unsanitized) column name — sanitization is a string-representation
+    /// concern only (the value gets parsed as source text); the live-object
+    /// path never needed it, so it isn't applied here.
+    Field(PlSmallStr),
+    Literal(LiteralValue),
+    BinOp {
+        left: Box<PaIr>,
+        op: Operator,
+        right: Box<PaIr>,
+    },
+    Xor(Box<PaIr>, Box<PaIr>),
+    /// `eq_missing`/`ne_missing`. `literal: None` is a null-literal comparison
+    /// (`is_null`/`~is_null`); `Some` is the compound null-safe-equality form.
+    ValidityCompare {
+        column: Box<PaIr>,
+        literal: Option<Box<PaIr>>,
+        eq: bool,
+    },
+    Not(Box<PaIr>),
+    IsNull(Box<PaIr>),
+    IsNotNull(Box<PaIr>),
+    /// The `bool` is whether the operand's dtype supports `is_nan` at all
+    /// (`false` for e.g. `Decimal`). Only the object renderer enforces this
+    /// today, matching `aexpr_to_pyarrow`'s existing guard; the string
+    /// renderer doesn't check it, matching `predicate_to_pa`'s current
+    /// behavior. Computed once here either way, since it needs the schema.
+    IsNan(Box<PaIr>, bool),
+    IsNotNan(Box<PaIr>, bool),
+    StartsWith(Box<PaIr>, String),
+    #[cfg(feature = "is_in")]
+    IsIn(Box<PaIr>, IsInHaystack),
+    Between {
+        column: Box<PaIr>,
+        left_op: Operator,
+        lower: Box<PaIr>,
+        right_op: Operator,
+        upper: Box<PaIr>,
+    },
+}
+
+/// Build the shared IR for `predicate`. `schema` is the scan output schema,
+/// used to resolve column dtypes so that only arithmetic provably equivalent
+/// to Polars' is lowered (see [`is_float64_arithmetic`]), and so the
+/// `is_nan`/`is_not_nan` dtype guard can be evaluated.
+fn to_pa_ir(predicate: Node, expr_arena: &Arena<AExpr>, schema: &Schema) -> Option<PaIr> {
+    match expr_arena.get(predicate) {
+        AExpr::BinaryExpr { left, right, op } => match op {
+            Operator::EqValidity | Operator::NotEqValidity => {
+                // The column is repeated in the output, so restrict this to plain columns.
+                let (column, literal_node, lv) =
+                    match (expr_arena.get(*left), expr_arena.get(*right)) {
+                        (AExpr::Column(_), AExpr::Literal(lv)) => (*left, *right, lv),
+                        (AExpr::Literal(lv), AExpr::Column(_)) => (*right, *left, lv),
+                        _ => return None,
+                    };
+
+                let eq = matches!(op, Operator::EqValidity);
+                let column = Box::new(to_pa_ir(column, expr_arena, schema)?);
+
+                let literal = if lv.is_null() {
+                    None
+                } else {
+                    Some(Box::new(to_pa_ir(literal_node, expr_arena, schema)?))
+                };
+
+                Some(PaIr::ValidityCompare {
+                    column,
+                    literal,
+                    eq,
+                })
+            },
+            Operator::Xor => {
+                if !(returns_boolean(*left, expr_arena) && returns_boolean(*right, expr_arena)) {
+                    return None;
+                }
+
+                let l = to_pa_ir(*left, expr_arena, schema)?;
+                let r = to_pa_ir(*right, expr_arena, schema)?;
+                Some(PaIr::Xor(Box::new(l), Box::new(r)))
+            },
+            op => {
+                reject_inexact_arithmetic(*left, *right, *op, expr_arena, schema)?;
+
+                let left = to_pa_ir(*left, expr_arena, schema)?;
+                let right = to_pa_ir(*right, expr_arena, schema)?;
+
+                Some(PaIr::BinOp {
+                    left: Box::new(left),
+                    op: *op,
+                    right: Box::new(right),
+                })
+            },
+        },
+        AExpr::Column(name) => Some(PaIr::Field(name.clone())),
+        // Only meaningful as the haystack of an `is_in`, which handles it itself.
+        AExpr::Literal(LiteralValue::Series(_)) => None,
+        AExpr::Literal(lv) => Some(PaIr::Literal(lv.clone())),
+        #[cfg(feature = "is_in")]
+        AExpr::Function {
+            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsIn { nulls_equal }),
+            input,
+            ..
+        } => {
+            let col = to_pa_ir(input.first()?.node(), expr_arena, schema)?;
+
+            let AExpr::Literal(lv) = expr_arena.get(input.get(1)?.node()) else {
+                return None;
+            };
+
+            let haystack = needle_isin_haystack(lv, *nulls_equal)?;
+            Some(PaIr::IsIn(Box::new(col), haystack))
+        },
+        #[cfg(feature = "is_between")]
+        AExpr::Function {
+            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsBetween { closed }),
+            input,
+            ..
+        } => {
+            if !matches!(expr_arena.get(input.first()?.node()), AExpr::Column(_)) {
+                return None;
+            }
+
+            let column = to_pa_ir(input.first()?.node(), expr_arena, schema)?;
+            let left_op = match closed {
+                ClosedInterval::None | ClosedInterval::Right => Operator::Gt,
+                ClosedInterval::Both | ClosedInterval::Left => Operator::GtEq,
+            };
+            let right_op = match closed {
+                ClosedInterval::None | ClosedInterval::Left => Operator::Lt,
+                ClosedInterval::Both | ClosedInterval::Right => Operator::LtEq,
+            };
+
+            let lower = to_pa_ir(input.get(1)?.node(), expr_arena, schema)?;
+            let upper = to_pa_ir(input.get(2)?.node(), expr_arena, schema)?;
+
+            Some(PaIr::Between {
+                column: Box::new(column),
+                left_op,
+                lower: Box::new(lower),
+                right_op,
+                upper: Box::new(upper),
+            })
+        },
+        #[cfg(feature = "strings")]
+        AExpr::Function {
+            function: IRFunctionExpr::StringExpr(IRStringFunction::StartsWith),
+            input,
+            ..
+        } => {
+            let col = to_pa_ir(input.first()?.node(), expr_arena, schema)?;
+            let AExpr::Literal(lv) = expr_arena.get(input.get(1)?.node()) else {
+                return None;
+            };
+            let prefix = sanitize(lv.extract_str()?)?.to_string();
+            Some(PaIr::StartsWith(Box::new(col), prefix))
+        },
+        AExpr::Function {
+            function, input, ..
+        } => {
+            let input_expr = input.first()?;
+            let input_ir = to_pa_ir(input_expr.node(), expr_arena, schema)?;
+
+            match function {
+                IRFunctionExpr::Boolean(IRBooleanFunction::Not) => {
+                    Some(PaIr::Not(Box::new(input_ir)))
+                },
+                IRFunctionExpr::Boolean(IRBooleanFunction::IsNull) => {
+                    Some(PaIr::IsNull(Box::new(input_ir)))
+                },
+                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNull) => {
+                    Some(PaIr::IsNotNull(Box::new(input_ir)))
+                },
+                // note: only applies to primitive (non-decimal) numeric types
+                IRFunctionExpr::Boolean(IRBooleanFunction::IsNan) => {
+                    let dtype = input_expr.dtype(schema, expr_arena).ok()?;
+                    let valid = dtype.is_primitive_numeric() || dtype.is_null();
+                    Some(PaIr::IsNan(Box::new(input_ir), valid))
+                },
+                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNan) => {
+                    let dtype = input_expr.dtype(schema, expr_arena).ok()?;
+                    let valid = dtype.is_primitive_numeric() || dtype.is_null();
+                    Some(PaIr::IsNotNan(Box::new(input_ir), valid))
+                },
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
 // Build an eval-able / AST-walker-compatible string predicate (e.g.
 // `pa.compute.field('x') > pa.compute.scalar(1)`). Used by the iceberg and
 // delta paths which feed the string into Python (delta `eval`s it,
@@ -150,45 +361,16 @@ pub fn predicate_to_pa(
     expr_arena: &Arena<AExpr>,
     schema: &Schema,
 ) -> Option<String> {
-    match expr_arena.get(predicate) {
-        AExpr::BinaryExpr { left, right, op } => match op {
-            Operator::EqValidity | Operator::NotEqValidity => {
-                validity_comparison_to_pa(*left, *right, *op, expr_arena, schema)
-            },
-            Operator::Xor => {
-                let (lhs, rhs) = boolean_operands_to_pa(*left, *right, expr_arena, schema)?;
+    render_pa_string(&to_pa_ir(predicate, expr_arena, schema)?)
+}
 
-                Some(format!("(({lhs} | {rhs}) & ~({lhs} & {rhs}))"))
-            },
-            op => {
-                let symbol = binary_op_symbol(op)?;
-                reject_inexact_arithmetic(*left, *right, *op, expr_arena, schema)?;
-
-                let mut lhs = predicate_to_pa(*left, expr_arena, schema)?;
-                let rhs = predicate_to_pa(*right, expr_arena, schema)?;
-
-                if op.is_arithmetic() {
-                    // PyArrow expressions define no reflected arithmetic operators, so a
-                    // bare Python literal on the left raises `TypeError` instead of
-                    // building an expression. (Comparisons are fine: Python falls back
-                    // to the reflected comparison on the right-hand expression.)
-                    if matches!(expr_arena.get(*left), AExpr::Literal(_))
-                        && !lhs.starts_with("pa.compute.")
-                    {
-                        lhs = format!("pa.compute.scalar({lhs})");
-                    }
-                }
-
-                Some(format!("({lhs} {symbol} {rhs})"))
-            },
-        },
-        AExpr::Column(name) => {
+fn render_pa_string(ir: &PaIr) -> Option<String> {
+    match ir {
+        PaIr::Field(name) => {
             let name = sanitize(name)?;
             Some(format!("pa.compute.field('{name}')"))
         },
-        // Only meaningful as the haystack of an `is_in`, which formats it itself.
-        AExpr::Literal(LiteralValue::Series(_)) => None,
-        AExpr::Literal(lv) => {
+        PaIr::Literal(lv) => {
             let av = lv.to_any_value()?;
             let dtype = av.dtype();
             match av.as_borrowed() {
@@ -225,147 +407,94 @@ pub fn predicate_to_pa(
                 },
             }
         },
-        #[cfg(feature = "is_in")]
-        AExpr::Function {
-            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsIn { nulls_equal }),
-            input,
-            ..
+        PaIr::BinOp { left, op, right } => {
+            let symbol = binary_op_symbol(op)?;
+            let mut lhs = render_pa_string(left)?;
+            let rhs = render_pa_string(right)?;
+
+            if op.is_arithmetic() {
+                // PyArrow expressions define no reflected arithmetic operators, so a
+                // bare Python literal on the left raises `TypeError` instead of
+                // building an expression. (Comparisons are fine: Python falls back
+                // to the reflected comparison on the right-hand expression.)
+                if matches!(**left, PaIr::Literal(_)) && !lhs.starts_with("pa.compute.") {
+                    lhs = format!("pa.compute.scalar({lhs})");
+                }
+            }
+
+            Some(format!("({lhs} {symbol} {rhs})"))
+        },
+        PaIr::Xor(l, r) => {
+            let lhs = render_pa_string(l)?;
+            let rhs = render_pa_string(r)?;
+            Some(format!("(({lhs} | {rhs}) & ~({lhs} & {rhs}))"))
+        },
+        PaIr::ValidityCompare {
+            column,
+            literal,
+            eq,
         } => {
-            let col = predicate_to_pa(input.first()?.node(), expr_arena, schema)?;
+            let column = render_pa_string(column)?;
 
-            let AExpr::Literal(lv) = expr_arena.get(input.get(1)?.node()) else {
-                return None;
-            };
+            Some(match literal {
+                None => {
+                    if *eq {
+                        format!("({column}).is_null()")
+                    } else {
+                        format!("~({column}).is_null()")
+                    }
+                },
+                Some(literal) => {
+                    let literal = render_pa_string(literal)?;
 
-            match needle_isin_haystack(lv, *nulls_equal)? {
+                    // A null column value is not equal to a non-null literal, whereas
+                    // the plain comparison would evaluate to null.
+                    if *eq {
+                        format!("(({column} == {literal}) & ~({column}).is_null())")
+                    } else {
+                        format!("(({column} != {literal}) | ({column}).is_null())")
+                    }
+                },
+            })
+        },
+        PaIr::Not(inner) => Some(format!("~({})", render_pa_string(inner)?)),
+        PaIr::IsNull(inner) => Some(format!("({}).is_null()", render_pa_string(inner)?)),
+        PaIr::IsNotNull(inner) => Some(format!("~({}).is_null()", render_pa_string(inner)?)),
+        PaIr::IsNan(inner, _valid) => Some(format!("({}).is_nan()", render_pa_string(inner)?)),
+        PaIr::IsNotNan(inner, _valid) => Some(format!("~({}).is_nan()", render_pa_string(inner)?)),
+        PaIr::StartsWith(col, prefix) => {
+            let col = render_pa_string(col)?;
+            Some(format!("pa.compute.starts_with({col}, pattern='{prefix}')"))
+        },
+        #[cfg(feature = "is_in")]
+        PaIr::IsIn(col, haystack) => {
+            let col = render_pa_string(col)?;
+            match haystack {
                 IsInHaystack::Empty => Some("pa.compute.scalar(False)".to_string()),
                 IsInHaystack::Series(s) => {
-                    let values = series_to_pyarrow_list(&s)?;
+                    let values = series_to_pyarrow_list(s)?;
                     Some(format!("({col}).isin({values})"))
                 },
             }
         },
-        #[cfg(feature = "is_between")]
-        AExpr::Function {
-            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsBetween { closed }),
-            input,
-            ..
+        PaIr::Between {
+            column,
+            left_op,
+            lower,
+            right_op,
+            upper,
         } => {
-            if !matches!(expr_arena.get(input.first()?.node()), AExpr::Column(_)) {
-                None
-            } else {
-                let col = predicate_to_pa(input.first()?.node(), expr_arena, schema)?;
-                let left_cmp_op = match closed {
-                    ClosedInterval::None | ClosedInterval::Right => Operator::Gt,
-                    ClosedInterval::Both | ClosedInterval::Left => Operator::GtEq,
-                };
-                let right_cmp_op = match closed {
-                    ClosedInterval::None | ClosedInterval::Left => Operator::Lt,
-                    ClosedInterval::Both | ClosedInterval::Right => Operator::LtEq,
-                };
+            let column = render_pa_string(column)?;
+            let left_symbol = binary_op_symbol(left_op)?;
+            let right_symbol = binary_op_symbol(right_op)?;
+            let lower = render_pa_string(lower)?;
+            let upper = render_pa_string(upper)?;
 
-                let lower = predicate_to_pa(input.get(1)?.node(), expr_arena, schema)?;
-                let upper = predicate_to_pa(input.get(2)?.node(), expr_arena, schema)?;
-
-                Some(format!(
-                    "(({col} {left_cmp_op} {lower}) & ({col} {right_cmp_op} {upper}))"
-                ))
-            }
+            Some(format!(
+                "(({column} {left_symbol} {lower}) & ({column} {right_symbol} {upper}))"
+            ))
         },
-        #[cfg(feature = "strings")]
-        AExpr::Function {
-            function: IRFunctionExpr::StringExpr(IRStringFunction::StartsWith),
-            input,
-            ..
-        } => {
-            let col = predicate_to_pa(input.first()?.node(), expr_arena, schema)?;
-            let AExpr::Literal(lv) = expr_arena.get(input.get(1)?.node()) else {
-                return None;
-            };
-            let prefix = sanitize(lv.extract_str()?)?;
-            Some(format!("pa.compute.starts_with({col}, pattern='{prefix}')"))
-        },
-        AExpr::Function {
-            function, input, ..
-        } => {
-            let input = input.first().unwrap().node();
-            let input = predicate_to_pa(input, expr_arena, schema)?;
-
-            match function {
-                IRFunctionExpr::Boolean(IRBooleanFunction::Not) => Some(format!("~({input})")),
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNull) => {
-                    Some(format!("({input}).is_null()"))
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNull) => {
-                    Some(format!("~({input}).is_null()"))
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNan) => {
-                    Some(format!("({input}).is_nan()"))
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNan) => {
-                    Some(format!("~({input}).is_nan()"))
-                },
-                _ => None,
-            }
-        },
-        _ => None,
     }
-}
-
-/// Lower `eq_missing` / `ne_missing` against a literal, where the null handling
-/// can be spelled out with `is_null`. `None` for any other operands.
-fn validity_comparison_to_pa(
-    left: Node,
-    right: Node,
-    op: Operator,
-    expr_arena: &Arena<AExpr>,
-    schema: &Schema,
-) -> Option<String> {
-    // The column is repeated in the output, so restrict this to plain columns.
-    let (column, literal, lv) = match (expr_arena.get(left), expr_arena.get(right)) {
-        (AExpr::Column(_), AExpr::Literal(lv)) => (left, right, lv),
-        (AExpr::Literal(lv), AExpr::Column(_)) => (right, left, lv),
-        _ => return None,
-    };
-
-    let eq = matches!(op, Operator::EqValidity);
-    let column = predicate_to_pa(column, expr_arena, schema)?;
-
-    Some(if lv.is_null() {
-        if eq {
-            format!("({column}).is_null()")
-        } else {
-            format!("~({column}).is_null()")
-        }
-    } else {
-        let literal = predicate_to_pa(literal, expr_arena, schema)?;
-
-        // A null column value is not equal to a non-null literal, whereas the
-        // plain comparison would evaluate to null.
-        if eq {
-            format!("(({column} == {literal}) & ~({column}).is_null())")
-        } else {
-            format!("(({column} != {literal}) | ({column}).is_null())")
-        }
-    })
-}
-
-/// Lower both operands of a boolean-only operator, or `None` if either is not
-/// known to be boolean.
-fn boolean_operands_to_pa(
-    left: Node,
-    right: Node,
-    expr_arena: &Arena<AExpr>,
-    schema: &Schema,
-) -> Option<(String, String)> {
-    if !(returns_boolean(left, expr_arena) && returns_boolean(right, expr_arena)) {
-        return None;
-    }
-
-    Some((
-        predicate_to_pa(left, expr_arena, schema)?,
-        predicate_to_pa(right, expr_arena, schema)?,
-    ))
 }
 
 /// Whether the expression is known to be boolean without consulting the schema.
@@ -597,123 +726,96 @@ pub fn aexpr_to_pyarrow<'py>(
     expr_arena: &Arena<AExpr>,
     schema: &Schema,
 ) -> Option<Bound<'py, PyAny>> {
-    match expr_arena.get(predicate) {
-        AExpr::BinaryExpr { left, right, op } => {
-            if matches!(op, Operator::Xor) {
-                if !(returns_boolean(*left, expr_arena) && returns_boolean(*right, expr_arena)) {
-                    return None;
-                }
+    render_pa_object(py, pc, &to_pa_ir(predicate, expr_arena, schema)?)
+}
 
-                let l = aexpr_to_pyarrow(py, pc, *left, expr_arena, schema)?;
-                let r = aexpr_to_pyarrow(py, pc, *right, expr_arena, schema)?;
-                let any = l.call_method1("__or__", (&r,)).ok()?;
-                let both = l
-                    .call_method1("__and__", (&r,))
-                    .ok()?
-                    .call_method0("__invert__")
-                    .ok()?;
-
-                return any.call_method1("__and__", (both,)).ok();
-            }
-
-            let method = binary_op_method(op)?;
-            reject_inexact_arithmetic(*left, *right, *op, expr_arena, schema)?;
-
-            let l = aexpr_to_pyarrow(py, pc, *left, expr_arena, schema)?;
-            let r = aexpr_to_pyarrow(py, pc, *right, expr_arena, schema)?;
-            l.call_method1(method, (r,)).ok()
-        },
-        AExpr::Column(name) => pc.call_method1("field", (name,)).ok(),
-        AExpr::Literal(LiteralValue::Series(_)) => None,
-        AExpr::Literal(lv) => {
+fn render_pa_object<'py>(
+    py: Python<'py>,
+    pc: &Bound<'py, PyAny>,
+    ir: &PaIr,
+) -> Option<Bound<'py, PyAny>> {
+    match ir {
+        PaIr::Field(name) => pc.call_method1("field", (name,)).ok(),
+        PaIr::Literal(lv) => {
             let av = lv.to_any_value()?;
             let val = anyvalue_to_py(py, av)?;
             pc.call_method1("scalar", (val,)).ok()
         },
-        #[cfg(feature = "is_in")]
-        AExpr::Function {
-            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsIn { nulls_equal }),
-            input,
-            ..
-        } => {
-            let col = aexpr_to_pyarrow(py, pc, input.first()?.node(), expr_arena, schema)?;
-            let rhs_node = input.get(1)?.node();
+        PaIr::BinOp { left, op, right } => {
+            let method = binary_op_method(op)?;
+            let l = render_pa_object(py, pc, left)?;
+            let r = render_pa_object(py, pc, right)?;
+            l.call_method1(method, (r,)).ok()
+        },
+        PaIr::Xor(l, r) => {
+            let l = render_pa_object(py, pc, l)?;
+            let r = render_pa_object(py, pc, r)?;
+            let any = l.call_method1("__or__", (&r,)).ok()?;
+            let both = l
+                .call_method1("__and__", (&r,))
+                .ok()?
+                .call_method0("__invert__")
+                .ok()?;
 
-            let AExpr::Literal(lv) = expr_arena.get(rhs_node) else {
+            any.call_method1("__and__", (both,)).ok()
+        },
+        // `scan_pyarrow_dataset` has never needed a validity-comparison or
+        // starts_with translation; preserve that rather than newly enabling
+        // it here, untested.
+        PaIr::ValidityCompare { .. } | PaIr::StartsWith(..) => None,
+        PaIr::Not(inner) => render_pa_object(py, pc, inner)?
+            .call_method0("__invert__")
+            .ok(),
+        PaIr::IsNull(inner) => render_pa_object(py, pc, inner)?
+            .call_method0("is_null")
+            .ok(),
+        PaIr::IsNotNull(inner) => render_pa_object(py, pc, inner)?
+            .call_method0("is_null")
+            .ok()?
+            .call_method0("__invert__")
+            .ok(),
+        PaIr::IsNan(inner, valid) => {
+            if !valid {
                 return None;
-            };
-            let values_list = match needle_isin_haystack(lv, *nulls_equal)? {
+            }
+            render_pa_object(py, pc, inner)?.call_method0("is_nan").ok()
+        },
+        PaIr::IsNotNan(inner, valid) => {
+            if !valid {
+                return None;
+            }
+            render_pa_object(py, pc, inner)?
+                .call_method0("is_nan")
+                .ok()?
+                .call_method0("__invert__")
+                .ok()
+        },
+        #[cfg(feature = "is_in")]
+        PaIr::IsIn(col, haystack) => {
+            let col = render_pa_object(py, pc, col)?;
+            let values_list = match haystack {
                 IsInHaystack::Empty => return pc.call_method1("scalar", (false,)).ok(),
-                IsInHaystack::Series(s) => series_to_py_list(py, &s)?,
+                IsInHaystack::Series(s) => series_to_py_list(py, s)?,
             };
 
             col.call_method1("isin", (values_list,)).ok()
         },
-        #[cfg(feature = "is_between")]
-        AExpr::Function {
-            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsBetween { closed }),
-            input,
-            ..
+        PaIr::Between {
+            column,
+            left_op,
+            lower,
+            right_op,
+            upper,
         } => {
-            if !matches!(expr_arena.get(input.first()?.node()), AExpr::Column(_)) {
-                return None;
-            }
-            let col = aexpr_to_pyarrow(py, pc, input.first()?.node(), expr_arena, schema)?;
-            let left_method = match closed {
-                ClosedInterval::None | ClosedInterval::Right => "__gt__",
-                ClosedInterval::Both | ClosedInterval::Left => "__ge__",
-            };
-            let right_method = match closed {
-                ClosedInterval::None | ClosedInterval::Left => "__lt__",
-                ClosedInterval::Both | ClosedInterval::Right => "__le__",
-            };
+            let column = render_pa_object(py, pc, column)?;
+            let left_method = binary_op_method(left_op)?;
+            let right_method = binary_op_method(right_op)?;
+            let lower = render_pa_object(py, pc, lower)?;
+            let upper = render_pa_object(py, pc, upper)?;
 
-            let lower = aexpr_to_pyarrow(py, pc, input.get(1)?.node(), expr_arena, schema)?;
-            let upper = aexpr_to_pyarrow(py, pc, input.get(2)?.node(), expr_arena, schema)?;
-
-            let lower_cmp = col.call_method1(left_method, (lower,)).ok()?;
-            let upper_cmp = col.call_method1(right_method, (upper,)).ok()?;
+            let lower_cmp = column.call_method1(left_method, (lower,)).ok()?;
+            let upper_cmp = column.call_method1(right_method, (upper,)).ok()?;
             lower_cmp.call_method1("__and__", (upper_cmp,)).ok()
         },
-        AExpr::Function {
-            function, input, ..
-        } => {
-            let input = input.first()?;
-            if matches!(
-                function, // note: only applies to primitive (non-decimal) numeric types
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNan | IRBooleanFunction::IsNotNan)
-            ) {
-                let dtype = input.dtype(schema, expr_arena).ok()?;
-                if !dtype.is_primitive_numeric() && !dtype.is_null() {
-                    return None;
-                }
-            }
-            let input = aexpr_to_pyarrow(py, pc, input.node(), expr_arena, schema)?;
-
-            match function {
-                IRFunctionExpr::Boolean(IRBooleanFunction::Not) => {
-                    // ~ operator
-                    input.call_method0("__invert__").ok()
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNull) => {
-                    input.call_method0("is_null").ok()
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNull) => input
-                    .call_method0("is_null")
-                    .ok()?
-                    .call_method0("__invert__")
-                    .ok(),
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNan) => {
-                    input.call_method0("is_nan").ok()
-                },
-                IRFunctionExpr::Boolean(IRBooleanFunction::IsNotNan) => input
-                    .call_method0("is_nan")
-                    .ok()?
-                    .call_method0("__invert__")
-                    .ok(),
-                _ => None,
-            }
-        },
-        _ => None,
     }
 }
