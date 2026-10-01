@@ -376,10 +376,8 @@ class TestIcebergScanIO:
     def test_scan_iceberg_filter_struct_field_special_char_name(
         self, tmp_path: Path
     ) -> None:
-        # A special character in a nested field's name forces Polars to read
-        # it through a renamed (`Mapped`) projection, which previously
-        # crashed the native reader's skip-batches statistics with
-        # StructFieldNotFoundError.
+        # Special character forces a renamed (`Mapped`) projection, which
+        # used to crash skip-batches statistics with StructFieldNotFoundError.
         tbl, _ = new_iceberg_table(
             tmp_path,
             schema=IcebergSchema(
