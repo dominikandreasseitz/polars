@@ -373,20 +373,13 @@ class TestIcebergScanIO:
             f"iceberg_table_filter = {Not(IsNaN('value'))!r}" in capfd.readouterr().err
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known bug in the native reader's skip-batches statistics for "
-            "nested struct fields: StructFieldNotFoundError. Root cause "
-            "confirmed and fix plan written up in "
-            "ISSUE_skip_batches_struct_field_special_chars.md on this "
-            "branch - remove this xfail once the fix lands."
-        ),
-        raises=pl.exceptions.StructFieldNotFoundError,
-        strict=True,
-    )
     def test_scan_iceberg_filter_struct_field_special_char_name(
         self, tmp_path: Path
     ) -> None:
+        # A special character in a nested field's name forces Polars to read
+        # it through a renamed (`Mapped`) projection, which previously
+        # crashed the native reader's skip-batches statistics with
+        # StructFieldNotFoundError.
         tbl, _ = new_iceberg_table(
             tmp_path,
             schema=IcebergSchema(
