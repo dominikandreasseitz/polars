@@ -373,6 +373,35 @@ class TestIcebergScanIO:
             f"iceberg_table_filter = {Not(IsNaN('value'))!r}" in capfd.readouterr().err
         )
 
+    def test_scan_iceberg_filter_struct_field_special_char_name(
+        self, tmp_path: Path
+    ) -> None:
+        # Special character forces a renamed (`Mapped`) projection, which
+        # used to crash skip-batches statistics with StructFieldNotFoundError.
+        tbl, _ = new_iceberg_table(
+            tmp_path,
+            schema=IcebergSchema(
+                NestedField(1, "id", LongType()),
+                NestedField(
+                    2,
+                    "mydict",
+                    StructType(NestedField(3, "age!", LongType())),
+                    required=False,
+                ),
+            ),
+        )
+        pl.DataFrame(
+            {"id": [1, 2], "mydict": [{"age!": 17}, {"age!": 42}]},
+            schema={"id": pl.Int64, "mydict": pl.Struct({"age!": pl.Int64})},
+        ).write_iceberg(tbl, mode="append")
+
+        res = (
+            pl.scan_iceberg(tbl)
+            .filter(pl.col("mydict").struct.field("age!") == 17)
+            .select("id")
+        )
+        assert res.collect().rows() == [(1,)]
+
     @pytest.mark.parametrize("method", ["is_nan", "is_not_nan"])
     def test_scan_iceberg_nan_decimal_rejected(
         self, tmp_path: Path, method: str

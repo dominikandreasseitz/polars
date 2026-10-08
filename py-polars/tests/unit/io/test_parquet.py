@@ -3865,6 +3865,75 @@ def test_scan_parquet_skip_row_groups_with_cast_inclusions(
     assert_frame_equal(out, pl.select(x=value).select(pl.first().cast(scan_dtype)))
 
 
+@pytest.mark.parametrize(
+    ("write_value", "scan_dtype", "filter_expr", "expected_value"),
+    [
+        (
+            {"a": 1},
+            pl.Struct({"a": pl.Int64, "b": pl.Int64}),
+            pl.col("s").struct.field("b").is_null(),
+            {"a": 1, "b": None},
+        ),
+        (
+            {"t": {"a": 1}},
+            pl.Struct({"t": pl.Struct({"a": pl.Int64, "b": pl.Int64})}),
+            pl.col("s").struct.field("t").struct.field("b").is_null(),
+            {"t": {"a": 1, "b": None}},
+        ),
+    ],
+)
+def test_scan_parquet_skip_row_groups_missing_struct_field(
+    write_value: dict[str, Any],
+    scan_dtype: pl.DataType,
+    filter_expr: pl.Expr,
+    expected_value: dict[str, Any],
+) -> None:
+    # Inserting a missing struct field used to crash StructFieldNotFoundError:
+    # min/max stats widened to the new shape, null_count didn't.
+    f = io.BytesIO()
+    pl.DataFrame({"s": [write_value, write_value]}).write_parquet(f)
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": scan_dtype},
+        cast_options=pl.ScanCastOptions(missing_struct_fields="insert"),
+    ).filter(filter_expr)
+
+    expected = pl.DataFrame(
+        {"s": [expected_value, expected_value]}, schema={"s": scan_dtype}
+    )
+
+    assert_frame_equal(q.collect(), expected)
+    assert_frame_equal(
+        q.collect(optimizations=pl.QueryOptFlags(predicate_pushdown=False)), expected
+    )
+
+
+def test_scan_parquet_skip_row_groups_struct_cast_keeps_null_count(
+    plmonkeypatch: PlMonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # A cast-only struct (same fields) must keep its real null_count stats,
+    # not fall back to "unknown".
+    f = io.BytesIO()
+    pl.DataFrame(
+        {"s": [{"a": 1}, {"a": 2}]}, schema={"s": pl.Struct({"a": pl.Int8})}
+    ).write_parquet(f)
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": pl.Struct({"a": pl.Int64})},
+        cast_options=pl.ScanCastOptions(integer_cast="upcast"),
+    ).filter(pl.col("s").struct.field("a").is_null())
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    out = q.collect()
+    assert "reading 0 / 1 row groups" in capfd.readouterr().err
+    assert_frame_equal(out, pl.DataFrame(schema={"s": pl.Struct({"a": pl.Int64})}))
+
+
 @pytest.mark.may_fail_cloud  # reason: looks at stdout
 @pytest.mark.parametrize(
     ("df", "predicate", "reading"),
