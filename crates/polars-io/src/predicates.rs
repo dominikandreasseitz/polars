@@ -589,6 +589,44 @@ pub struct ScanIOPredicate {
     pub hive_predicate_is_full_predicate: bool,
 }
 
+/// Dtype of a column's `<col>_nc` (null-count) column: struct dtypes get a per-field count,
+/// everything else a single [`IDX_DTYPE`] count.
+///
+/// Mirrors `polars-plan`'s `null_count_dtype`; duplicated since `polars-io` can't depend on it.
+fn null_count_dtype(dtype: &DataType) -> DataType {
+    match dtype {
+        #[cfg(feature = "dtype-struct")]
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|f| Field::new(f.name().clone(), null_count_dtype(f.dtype())))
+                .collect(),
+        ),
+        _ => IDX_DTYPE,
+    }
+}
+
+/// Constant `<col>_nc` value matching [`null_count_dtype`]'s shape.
+fn constant_null_count_value(dtype: &DataType, is_null: bool) -> AnyValue<'static> {
+    match dtype {
+        #[cfg(feature = "dtype-struct")]
+        DataType::Struct(fields) => AnyValue::StructOwned(Box::new((
+            fields
+                .iter()
+                .map(|f| constant_null_count_value(f.dtype(), is_null))
+                .collect(),
+            fields.clone(),
+        ))),
+        _ => {
+            if is_null {
+                AnyValue::Null
+            } else {
+                (0 as IdxSize).into()
+            }
+        },
+    }
+}
+
 impl ScanIOPredicate {
     /// Whether the predicate or a range hint reads the column.
     pub fn reads_column(&self, name: &str) -> bool {
@@ -615,13 +653,9 @@ impl ScanIOPredicate {
             for (c, v) in constant_columns.iter() {
                 sbp_constant_columns.push((format_pl_smallstr!("{c}_min"), v.clone()));
                 sbp_constant_columns.push((format_pl_smallstr!("{c}_max"), v.clone()));
-                let nc = if v.is_null() {
-                    AnyValue::Null
-                } else {
-                    (0 as IdxSize).into()
-                };
-                sbp_constant_columns
-                    .push((format_pl_smallstr!("{c}_nc"), Scalar::new(IDX_DTYPE, nc)));
+                let nc_dtype = null_count_dtype(v.dtype());
+                let nc = constant_null_count_value(v.dtype(), v.is_null());
+                sbp_constant_columns.push((format_pl_smallstr!("{c}_nc"), Scalar::new(nc_dtype, nc)));
             }
             self.skip_batch_predicate = Some(Arc::new(PhysicalExprWithConstCols {
                 constants: sbp_constant_columns,

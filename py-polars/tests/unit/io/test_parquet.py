@@ -2502,6 +2502,25 @@ def test_scan_parquet_missing_columns(
     )
 
 
+def test_missing_struct_column_insert_skip_batch_null_count(tmp_path: Path) -> None:
+    # A struct column missing from a file is filled in as a constant column via
+    # `missing_columns="insert"`. Its `<col>_nc` skip-batch stat must mirror the
+    # struct's shape (one count per field), not a scalar row count.
+    struct_dtype = pl.Struct({"x": pl.Int64, "y": pl.Int64})
+    pl.DataFrame(
+        {"a": 1, "s": [{"x": 1, "y": 2}]}, schema={"a": pl.Int64, "s": struct_dtype}
+    ).write_parquet(tmp_path / "1")
+    pl.DataFrame({"a": 2}).write_parquet(tmp_path / "2")
+
+    out = (
+        pl.scan_parquet([tmp_path / "1", tmp_path / "2"], missing_columns="insert")
+        .filter(pl.col("s").struct.field("y").is_null())
+        .collect()
+    )
+    expected = pl.DataFrame({"a": 2, "s": None}, schema={"a": pl.Int64, "s": struct_dtype})
+    assert_frame_equal(out, expected)
+
+
 def test_nested_nonnullable_19158() -> None:
     # Bug is based on the top-level struct being nullable and the inner list
     # not being nullable.
