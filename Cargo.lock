@@ -3842,7 +3842,6 @@ dependencies = [
  "regex",
  "serde",
  "sqlparser",
- "tempfile",
 ]
 
 [[package]]
@@ -3881,6 +3880,7 @@ dependencies = [
  "polars-ops",
  "polars-parquet",
  "polars-plan",
+ "polars-row",
  "polars-time",
  "polars-utils",
  "pyo3",

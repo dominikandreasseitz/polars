@@ -3042,13 +3042,16 @@ def test_utf8_verification_with_slice_20174() -> None:
     )
 
 
-def test_invalid_utf8_at_end_of_inline_string() -> None:
+@pytest.mark.parametrize("compression", ["snappy", "none"])
+def test_invalid_utf8_at_end_of_inline_string(compression: str) -> None:
     # The invalid bytes are in the last 4 bytes of a string that is inlined in its
     # view, next to a string of at least 128 bytes.
     for value in [b"yyyyyabc\xe6\x9d", b"yyyyyyyyyyy\xff"]:
         f = io.BytesIO()
         s = pa.array([b"a" * 200, value], pa.binary()).view(pa.string())
-        pq.write_table(pa.table({"s": s}), f, use_dictionary=False)
+        pq.write_table(
+            pa.table({"s": s}), f, use_dictionary=False, compression=compression
+        )
         f.seek(0)
         with pytest.raises(pl.exceptions.ComputeError, match=r"(?i)invalid utf-?8"):
             pl.read_parquet(f)
@@ -4126,6 +4129,175 @@ def test_scan_parquet_skip_row_groups_with_cast_inclusions(
     assert "reading 1 / 1 row groups" in capfd.readouterr().err
 
     assert_frame_equal(out, pl.select(x=value).select(pl.first().cast(scan_dtype)))
+
+
+@pytest.mark.parametrize(
+    ("write_value", "scan_dtype", "filter_expr", "expected_value"),
+    [
+        (
+            {"a": 1},
+            pl.Struct({"a": pl.Int64, "b": pl.Int64}),
+            pl.col("s").struct.field("b").is_null(),
+            {"a": 1, "b": None},
+        ),
+        (
+            {"t": {"a": 1}},
+            pl.Struct({"t": pl.Struct({"a": pl.Int64, "b": pl.Int64})}),
+            pl.col("s").struct.field("t").struct.field("b").is_null(),
+            {"t": {"a": 1, "b": None}},
+        ),
+    ],
+)
+def test_scan_parquet_skip_row_groups_missing_struct_field(
+    write_value: dict[str, Any],
+    scan_dtype: pl.DataType,
+    filter_expr: pl.Expr,
+    expected_value: dict[str, Any],
+) -> None:
+    # A missing struct field: min/max widen correctly, null_count must too.
+    f = io.BytesIO()
+    pl.DataFrame({"s": [write_value, write_value]}).write_parquet(f)
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": scan_dtype},
+        cast_options=pl.ScanCastOptions(missing_struct_fields="insert"),
+    ).filter(filter_expr)
+
+    expected = pl.DataFrame(
+        {"s": [expected_value, expected_value]}, schema={"s": scan_dtype}
+    )
+
+    assert_frame_equal(q.collect(), expected)
+    assert_frame_equal(
+        q.collect(optimizations=pl.QueryOptFlags(predicate_pushdown=False)), expected
+    )
+
+
+def test_scan_parquet_skip_row_groups_struct_cast_keeps_null_count(
+    plmonkeypatch: PlMonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # A cast-only struct must keep its real null_count, not fall back to "unknown".
+    f = io.BytesIO()
+    pl.DataFrame(
+        {"s": [{"a": 1}, {"a": 2}]}, schema={"s": pl.Struct({"a": pl.Int8})}
+    ).write_parquet(f)
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": pl.Struct({"a": pl.Int64})},
+        cast_options=pl.ScanCastOptions(integer_cast="upcast"),
+    ).filter(pl.col("s").struct.field("a").is_null())
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    out = q.collect()
+    assert "reading 0 / 1 row groups" in capfd.readouterr().err
+    assert_frame_equal(out, pl.DataFrame(schema={"s": pl.Struct({"a": pl.Int64})}))
+
+
+@pytest.mark.parametrize(
+    ("write_values", "scan_dtype", "filter_expr", "expected_value"),
+    [
+        (
+            [{"a": 1}, {"a": 2}, {"a": None}, {"a": None}],
+            pl.Struct({"a": pl.Int64, "b": pl.Int64}),
+            pl.col("s").struct.field("a").is_null(),
+            {"a": None, "b": None},
+        ),
+        (
+            [{"t": {"a": 1}}, {"t": {"a": 2}}, {"t": {"a": None}}, {"t": {"a": None}}],
+            pl.Struct({"t": pl.Struct({"a": pl.Int64, "b": pl.Int64})}),
+            pl.col("s").struct.field("t").struct.field("a").is_null(),
+            {"t": {"a": None, "b": None}},
+        ),
+    ],
+)
+def test_scan_parquet_skip_row_groups_struct_insert_keeps_sibling_null_count(
+    write_values: list[dict[str, Any]],
+    scan_dtype: pl.DataType,
+    filter_expr: pl.Expr,
+    expected_value: dict[str, Any],
+    plmonkeypatch: PlMonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    # Inserting a missing field must not blow away a sibling's own null-count pruning.
+    f = io.BytesIO()
+    pl.DataFrame({"s": write_values}).write_parquet(
+        f, row_group_size=2, statistics="full"
+    )
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": scan_dtype},
+        cast_options=pl.ScanCastOptions(missing_struct_fields="insert"),
+    ).filter(filter_expr)
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    out = q.collect()
+    assert "reading 1 / 2 row groups" in capfd.readouterr().err
+
+    expected = pl.DataFrame(
+        {"s": [expected_value, expected_value]}, schema={"s": scan_dtype}
+    )
+    assert_frame_equal(out, expected)
+
+
+def test_scan_parquet_skip_row_groups_struct_null_upcast() -> None:
+    # A physically `Null` field null-upcasts into a struct target - no source shape.
+    arrow_schema = pa.schema([("s", pa.struct([("x", pa.null())]))])
+    tbl = pa.table({"s": [{"x": None}, {"x": None}]}, schema=arrow_schema)
+    f = io.BytesIO()
+    pq.write_table(tbl, f)
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f, schema={"s": pl.Struct({"x": pl.Struct({"y": pl.Int64})})}
+    ).filter(pl.col("s").struct.field("x").struct.field("y").is_null())
+
+    expected = pl.DataFrame(
+        {"s": [{"x": None}, {"x": None}]},
+        schema={"s": pl.Struct({"x": pl.Struct({"y": pl.Int64})})},
+    )
+    assert_frame_equal(q.collect(), expected)
+
+
+def test_scan_parquet_skip_row_groups_struct_extra_field_dropped(
+    plmonkeypatch: PlMonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # Dropping an extra field narrows the struct - must not keep the wider shape.
+    f = io.BytesIO()
+    pl.DataFrame(
+        {
+            "s": [
+                {"a": 1, "b": 1},
+                {"a": 2, "b": 1},
+                {"a": None, "b": 1},
+                {"a": None, "b": 1},
+            ]
+        }
+    ).write_parquet(f, row_group_size=2, statistics="full")
+    f.seek(0)
+
+    q = pl.scan_parquet(
+        f,
+        schema={"s": pl.Struct({"a": pl.Int64})},
+        cast_options=pl.ScanCastOptions(extra_struct_fields="ignore"),
+    ).filter(pl.col("s").struct.field("a").is_null())
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    out = q.collect()
+    assert "reading 1 / 2 row groups" in capfd.readouterr().err
+
+    expected = pl.DataFrame(
+        {"s": [{"a": None}, {"a": None}]}, schema={"s": pl.Struct({"a": pl.Int64})}
+    )
+    assert_frame_equal(out, expected)
 
 
 @pytest.mark.may_fail_cloud  # reason: looks at stdout
@@ -6192,3 +6364,112 @@ def test_write_list_null_count(data_page_size: int | None) -> None:
     statistics_pa = pq.read_metadata(f_pa).row_group(0).column(0).statistics
 
     assert statistics.null_count == statistics_pa.null_count == 4
+
+
+@pytest.mark.parametrize("compression", ["snappy", "zstd", "none"])
+@pytest.mark.parametrize("data_page_version", ["1.0", "2.0"])
+def test_plain_strings_small_pages(compression: str, data_page_version: str) -> None:
+    values = [
+        "a" * 12,
+        "b" * 13,
+        "é" * 64,
+        None,
+        "",
+        "東" * 43,
+        "x" * 128,
+        "😀" * 64,
+        "ab",
+        "c" * 300,
+    ]
+    df = pl.DataFrame({"s": values * 30}).with_row_index()
+    df = df.with_columns(l=pl.concat_list("s", "s"))
+
+    f = io.BytesIO()
+    pq.write_table(
+        df.to_arrow(),
+        f,
+        compression=compression,
+        use_dictionary=False,
+        data_page_size=512,
+        data_page_version=data_page_version,
+    )
+
+    f.seek(0)
+    out = pl.read_parquet(f)
+    assert_frame_equal(out, df)
+
+    for expr in [
+        pl.col("index") % 10 == 3,
+        pl.col("index") % 10 != 3,
+        pl.col("s").str.contains("é"),
+        pl.col("s") != "ab",
+    ]:
+        f.seek(0)
+        assert_frame_equal(pl.scan_parquet(f).filter(expr).collect(), df.filter(expr))
+
+    f.seek(0)
+    assert_frame_equal(pl.scan_parquet(f).slice(25, 100).collect(), df.slice(25, 100))
+
+    ipc = io.BytesIO()
+    out.write_ipc(ipc)
+    ipc.seek(0)
+    assert_frame_equal(pl.read_ipc(ipc), df)
+    assert_frame_equal(pl.from_arrow(out.to_arrow()), df)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [b"\x80abc", b"abc\xe6\x9d", b"ab\xbfcd" + b"y" * 20, b"y" * 200 + b"\xff"],
+)
+@pytest.mark.parametrize("neighbor", [b"x" * 5, "é".encode() * 100])
+@pytest.mark.parametrize("invalid_first", [True, False])
+def test_plain_strings_invalid_utf8(
+    invalid: bytes, neighbor: bytes, invalid_first: bool
+) -> None:
+    values = [invalid, neighbor] if invalid_first else [neighbor, invalid]
+    tbl = pa.table({"s": pa.array(values, pa.binary()).view(pa.string())})
+    f = io.BytesIO()
+    pq.write_table(tbl, f, use_dictionary=False, compression="snappy")
+    f.seek(0)
+    with pytest.raises(pl.exceptions.ComputeError, match=r"(?i)invalid utf-?8"):
+        pl.read_parquet(f)
+
+
+@pytest.mark.write_disk
+@pytest.mark.parametrize("defer_cached_reads", ["1", "0"])
+@pytest.mark.parametrize("row_group_sizes", [[0, 2], [2, 0], [2, 0, 2]])
+def test_parquet_empty_row_groups_29995(
+    tmp_path: Path,
+    plmonkeypatch: PlMonkeyPatch,
+    defer_cached_reads: str,
+    row_group_sizes: list[int],
+) -> None:
+    # pyarrow writes no pages for the columns of an empty row group.
+    tmp_path.mkdir(exist_ok=True)
+    path = tmp_path / "empty_row_groups.parquet"
+    schema = pa.schema([("a", pa.int64()), ("b", pa.bool_()), ("c", pa.bool_())])
+    expect = pl.DataFrame(schema={"a": pl.Int64, "b": pl.Boolean, "c": pl.Boolean})
+    with pq.ParquetWriter(path, schema) as writer:
+        for n in row_group_sizes:
+            df = pl.DataFrame(
+                {
+                    "a": range(expect.height, expect.height + n),
+                    "b": [True] * n,
+                    "c": [None] * n,
+                },
+                schema=expect.schema,
+            )
+            writer.write_table(df.to_arrow())
+            expect = expect.vstack(df)
+
+    plmonkeypatch.setenv("POLARS_FILE_DEFER_CACHED_READS", defer_cached_reads)
+    assert_frame_equal(pl.read_parquet(path), expect)
+    lf = pl.scan_parquet(path)
+    assert_frame_equal(lf.collect(), expect)
+    assert_frame_equal(lf.select("b", "c").collect(), expect.select("b", "c"))
+    assert_frame_equal(lf.select("a").collect(), expect.select("a"))
+    pred = pl.col("a") > 0
+    assert_frame_equal(
+        pl.scan_parquet(path, parallel="prefiltered").filter(pred).collect(),
+        expect.filter(pred),
+    )
