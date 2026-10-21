@@ -618,6 +618,39 @@ impl PyLazyFrame {
         })
     }
 
+    /// Optimize and return `(source index, columns kept in metadata)` for tests
+    /// and benchmarking, grouped by Parquet scan.
+    #[cfg(feature = "parquet")]
+    fn _retained_parquet_metadata_columns(&self, py: Python) -> PyResult<Vec<Vec<(usize, usize)>>> {
+        use polars_plan::dsl::FileScanIR;
+        use polars_plan::plans::{ArenaLpIter as _, IR};
+
+        py.enter_polars(|| {
+            let plan = self.ldf.read().clone().to_alp_optimized()?;
+
+            PolarsResult::Ok(
+                plan.lp_arena
+                    .iter(plan.lp_top)
+                    .filter_map(|(_, ir)| match ir {
+                        IR::Scan { scan_type, .. } => match scan_type.as_ref() {
+                            FileScanIR::Parquet {
+                                metadata_per_source,
+                                ..
+                            } => Some(
+                                metadata_per_source
+                                    .iter_resolved()
+                                    .map(|(i, md)| (i, md.schema_descr.columns().len()))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        })
+    }
+
     fn to_dot(&self, py: Python<'_>, optimized: bool) -> PyResult<String> {
         py.enter_polars(|| self.ldf.read().to_dot(optimized))
     }

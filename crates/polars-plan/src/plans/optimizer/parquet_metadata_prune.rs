@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "parquet")]
 use polars_io::parquet::metadata::FileMetadataRef;
+#[cfg(feature = "parquet")]
+use polars_utils::aliases::PlHashMap;
 use polars_utils::arena::{Arena, Node};
 #[cfg(feature = "parquet")]
 use polars_utils::pl_str::PlSmallStr;
@@ -20,7 +22,7 @@ use polars_utils::pl_str::PlSmallStr;
 use polars_utils::unitvec;
 
 #[cfg(feature = "parquet")]
-use crate::dsl::FileScanIR;
+use crate::dsl::{ColumnMapping, FileScanIR};
 #[cfg(feature = "parquet")]
 use crate::plans::AExpr;
 use crate::plans::IR;
@@ -63,12 +65,6 @@ pub(super) fn prune_parquet_metadata(
             continue;
         };
 
-        // Name-based pruning can drop mapped columns whose physical names differ,
-        // incorrectly returning nulls. Keep their metadata until pruning supports mappings.
-        if unified_scan_args.column_mapping.is_some() {
-            continue;
-        }
-
         let Some(projection) = unified_scan_args.projection.clone() else {
             continue;
         };
@@ -85,12 +81,49 @@ pub(super) fn prune_parquet_metadata(
             })
             .unwrap_or_default();
 
+        // A renamed column's on-disk name differs from its output name, so pruning by
+        // output name would drop it. Iceberg field IDs are stable across renames:
+        // resolve the output names to field IDs once here, then re-resolve those IDs
+        // to each file's own (possibly renamed) names inside `prune_one`.
+        let field_ids = match &unified_scan_args.column_mapping {
+            None => None,
+            Some(ColumnMapping::Iceberg { schema, .. }) => {
+                let name_to_id: PlHashMap<&str, i32> = schema
+                    .values()
+                    .filter_map(|c| Some((c.name.as_str(), i32::try_from(c.physical_id).ok()?)))
+                    .collect();
+                let resolve = |names: &[PlSmallStr]| -> Vec<i32> {
+                    names
+                        .iter()
+                        .filter_map(|n| name_to_id.get(n.as_str()).copied())
+                        .collect()
+                };
+                Some((resolve(&projection), resolve(&predicate_cols)))
+            },
+        };
+
         // Pruning failure (chunks-vs-leaves desync inside `from_compact`) is
         // recoverable; fall back to unpruned metadata so the query still runs.
         // The wire form just stays larger for this entry. Swap-only-if-smaller
         // (leaf count) avoids allocating a new inner Arc when nothing changed.
         let prune_one = |m: &FileMetadataRef| -> FileMetadataRef {
-            m.pruned(&projection, &predicate_cols)
+            let (keep, predicate_names) = match &field_ids {
+                None => (projection.to_vec(), predicate_cols.clone()),
+                Some((keep_ids, predicate_ids)) => {
+                    // Files added without Parquet field IDs (e.g. Iceberg `add_files`)
+                    // are matched by the reader via name mapping, not field ID; ID-based
+                    // pruning isn't possible for them. Leave such files unpruned rather
+                    // than resolve to an empty keep list and prune every column away.
+                    let Some(keep) = names_for_field_ids(&m.schema_descr, keep_ids) else {
+                        return m.clone();
+                    };
+                    let predicate_names =
+                        names_for_field_ids(&m.schema_descr, predicate_ids).unwrap_or_default();
+                    (keep, predicate_names)
+                },
+            };
+
+            m.pruned(&keep, &predicate_names)
                 .ok()
                 .filter(|p| p.schema_descr.columns().len() < m.schema_descr.columns().len())
                 .map(Arc::new)
@@ -98,6 +131,83 @@ pub(super) fn prune_parquet_metadata(
         };
 
         *metadata_per_source = metadata_per_source.map_footers(prune_one);
+    }
+}
+
+/// Resolves Iceberg field IDs to this file's own top-level column names, which may
+/// differ from the output names after a rename. Returns `None` if this file carries no
+/// Parquet field IDs at all (e.g. added via Iceberg `add_files`, matched by the reader
+/// through name mapping instead) - ID-based resolution isn't possible then, and the
+/// caller must not treat that as "nothing to keep". IDs absent from an ID-bearing file
+/// (e.g. a field added after it was written) are dropped individually, same as an
+/// absent name.
+#[cfg(feature = "parquet")]
+fn names_for_field_ids(
+    schema_descr: &polars_parquet::parquet::metadata::SchemaDescriptor,
+    ids: &[i32],
+) -> Option<Vec<PlSmallStr>> {
+    let id_to_name: PlHashMap<i32, &PlSmallStr> = schema_descr
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            let info = f.get_field_info();
+            Some((info.id?, &info.name))
+        })
+        .collect();
+    if id_to_name.is_empty() {
+        return None;
+    }
+    Some(
+        ids.iter()
+            .filter_map(|id| id_to_name.get(id).map(|n| (*n).clone()))
+            .collect(),
+    )
+}
+
+#[cfg(all(test, feature = "parquet"))]
+mod tests {
+    use polars_parquet::parquet::metadata::SchemaDescriptor;
+    use polars_parquet::parquet::schema::Repetition;
+    use polars_parquet::parquet::schema::types::{ParquetType, PhysicalType};
+
+    use super::names_for_field_ids;
+
+    fn leaf(name: &str, id: Option<i32>) -> ParquetType {
+        ParquetType::try_from_primitive(
+            name.into(),
+            PhysicalType::Int32,
+            Repetition::Optional,
+            None,
+            None,
+            id,
+        )
+        .unwrap()
+    }
+
+    /// `a` (id 1), `b` (no id), `c` (id 3).
+    fn schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            "root".into(),
+            vec![leaf("a", Some(1)), leaf("b", None), leaf("c", Some(3))],
+        )
+    }
+
+    #[test]
+    fn resolves_known_ids_to_this_files_names() {
+        assert_eq!(names_for_field_ids(&schema(), &[3, 1]).unwrap(), ["c", "a"]);
+    }
+
+    #[test]
+    fn drops_ids_this_file_has_no_field_for() {
+        assert_eq!(names_for_field_ids(&schema(), &[1, 2]).unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn none_when_file_has_no_field_ids_at_all() {
+        // E.g. a Parquet file added to an Iceberg table via `add_files`: matched by
+        // name mapping, not field ID. Must not be confused with "no columns to keep".
+        let no_ids = SchemaDescriptor::new("root".into(), vec![leaf("a", None), leaf("b", None)]);
+        assert_eq!(names_for_field_ids(&no_ids, &[1, 2]), None);
     }
 }
 
