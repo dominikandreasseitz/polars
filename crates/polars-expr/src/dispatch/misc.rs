@@ -53,9 +53,11 @@ pub(super) fn approx_quantile_sketch(
     s: &Column,
     method: &ApproxQuantileMethod,
     error: f64,
+    failure_probability: f64,
 ) -> PolarsResult<Column> {
     let input = s.as_materialized_series_maintain_scalar();
-    let out = polars_ops::prelude::approx_quantile_sketch(&input, error, method)?;
+    let out =
+        polars_ops::prelude::approx_quantile_sketch(&input, method, error, failure_probability)?;
     Ok(out.into_column())
 }
 
@@ -449,6 +451,10 @@ pub(super) fn row_hash(c: &Column, seed: u64) -> PolarsResult<Column> {
         .into_column())
 }
 
+pub(super) fn mm3_hash(c: &Column) -> PolarsResult<Column> {
+    polars_ops::series::mm3_hash(c.as_materialized_series()).map(Column::from)
+}
+
 #[cfg(feature = "arg_where")]
 pub(super) fn arg_where(s: &mut [Column]) -> PolarsResult<Column> {
     use polars_core::utils::polars_arrow::bitmap::utils::SlicesIterator;
@@ -762,6 +768,7 @@ fn trunc_arith_series(
     rhs: &Series,
     op: polars_plan::dsl::TruncArithOp,
 ) -> PolarsResult<Series> {
+    use polars_compute::arithmetic::DivRounding;
     use polars_plan::dsl::TruncArithOp;
 
     Ok(if lhs.dtype().is_decimal() || rhs.dtype().is_decimal() {
@@ -770,8 +777,8 @@ fn trunc_arith_series(
             let (l, r) = polars_core::series::arithmetic::coerce_lhs_rhs_numeric_op(lhs, rhs)?;
             let (l, r) = (l.decimal()?, r.decimal()?);
             match op {
-                TruncArithOp::Rem => l.rem_with(r, false)?,
-                TruncArithOp::IntDiv => l.int_div_with_scale(r, 0, false)?,
+                TruncArithOp::Rem => l.rem_with(r, DivRounding::Trunc)?,
+                TruncArithOp::IntDiv => l.int_div_with_scale(r, 0, DivRounding::Trunc)?,
             }
             .into_series()
         }

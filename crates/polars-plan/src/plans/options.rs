@@ -395,6 +395,10 @@ pub struct JoinOptionsIR {
     /// Ranges of build-side keys the join publishes to scans below its probe side once
     /// the build is done. Only set together with a forced `args.build_side`.
     pub runtime_filters: Vec<RuntimeFilter>,
+    /// The estimated rows of the left and right input of a semi or anti join that has
+    /// no `args.build_side`.
+    #[cfg_attr(feature = "ir_serde", serde(default))]
+    pub estimated_rows: Option<[u64; 2]>,
 }
 
 /// Largest ratio of distinct build keys to distinct probe keys for which a
@@ -450,10 +454,12 @@ impl JoinOptionsIR {
                     || how.is_range()
                     || how.is_inner()
                     || how.is_cross()
-                    || matches!(how, JoinType::Left | JoinType::Right)
+                    || matches!(how, JoinType::Left | JoinType::Right | JoinType::Full)
             },
             CrossAndFilter { .. } => {
-                how.is_inner() || how.is_cross() || matches!(how, JoinType::Left)
+                how.is_inner()
+                    || how.is_cross()
+                    || matches!(how, JoinType::Left | JoinType::Right | JoinType::Full)
             },
         };
 
@@ -473,6 +479,7 @@ impl JoinOptionsIR {
             args,
             options,
             runtime_filters,
+            estimated_rows,
         } = self;
 
         *allow_parallel == other.allow_parallel
@@ -480,6 +487,7 @@ impl JoinOptionsIR {
             && *args == other.args
             && options.shallow_eq(&other.options, expr_cmp)
             && *runtime_filters == other.runtime_filters
+            && *estimated_rows == other.estimated_rows
     }
 
     #[cfg(feature = "cse")]
@@ -494,6 +502,7 @@ impl JoinOptionsIR {
             args,
             options,
             runtime_filters,
+            estimated_rows,
         } = self;
 
         allow_parallel.hash(state);
@@ -501,6 +510,7 @@ impl JoinOptionsIR {
         args.hash(state);
         options.shallow_hash(state, expr_hash);
         runtime_filters.hash(state);
+        estimated_rows.hash(state);
     }
 }
 
@@ -886,6 +896,7 @@ impl From<JoinOptions> for JoinOptionsIR {
             args: opts.args,
             options: Default::default(),
             runtime_filters: Vec::new(),
+            estimated_rows: None,
         }
     }
 }

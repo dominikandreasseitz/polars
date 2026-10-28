@@ -13,6 +13,7 @@ from polars._utils.unstable import issue_unstable_warning
 from polars._utils.various import (
     is_int_sequence,
     normalize_filepath,
+    qualified_type_name,
 )
 from polars._utils.wrap import wrap_ldf
 from polars.convert import from_arrow
@@ -544,6 +545,7 @@ def scan_parquet(
     _default_values: DefaultFieldValues | None = None,
     _deletion_files: DeletionFiles | None = None,
     _table_statistics: DataFrame | None = None,
+    _hive_partitions: DataFrame | None = None,
     _row_count: tuple[int, int] | None = None,
     _source_sizes: Sequence[int] | None = None,
     _resolve_heavy_sources: int | None = None,
@@ -717,6 +719,15 @@ def scan_parquet(
         msg = "The `decryption` parameter of `scan_parquet` is considered unstable."
         issue_unstable_warning(msg)
 
+        from polars.io.parquet.decryption import ParquetDecryptionProperties
+
+        if not isinstance(decryption, ParquetDecryptionProperties):
+            msg = (
+                "`decryption` must be a `ParquetDecryptionProperties`, "
+                f"got {qualified_type_name(decryption)!r}"
+            )
+            raise TypeError(msg)
+
     sources = get_sources(source)
 
     credential_provider_builder = _init_credential_provider_builder(
@@ -763,6 +774,7 @@ def scan_parquet(
             default_values=_default_values,
             deletion_files=_deletion_files,
             table_statistics=_table_statistics,
+            hive_partitions=_hive_partitions,
             row_count=_row_count,
             source_sizes=_source_sizes,
             resolve_heavy_sources=_resolve_heavy_sources,
