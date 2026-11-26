@@ -10711,6 +10711,53 @@ def test_scan_iceberg_files_without_field_ids_use_name_mapping(
 
 
 @pytest.mark.write_disk
+def test_scan_iceberg_pruned_metadata_by_field_id(
+    tmp_path: Path, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # Swapped renames, a predicate, and a column added later.
+    tbl, catalog = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "a", LongType()),
+            NestedField(2, "b", LongType()),
+            NestedField(3, "d", LongType()),
+        ),
+    )
+    pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "d": [7, 8, 9]}).write_iceberg(
+        tbl, mode="append"
+    )
+    for old, new in [("a", "tmp"), ("b", "a"), ("tmp", "b")]:
+        with tbl.update_schema() as update:
+            update.rename_column(old, new)
+    with tbl.update_schema() as update:
+        update.add_column("c", LongType())
+    tbl = catalog.load_table(tbl.name())
+
+    plmonkeypatch.setenv("POLARS_PRUNE_PARQUET_METADATA", "1")
+
+    from polars._plr import PyLazyFrame
+    from polars._utils.wrap import wrap_ldf
+
+    lf = wrap_ldf(
+        PyLazyFrame.new_from_dataset_object(
+            new_iceberg_scan_resolver(tbl), resolve_heavy_sources=4
+        )
+    )
+
+    q = lf.filter(pl.col("a") > 4).select("b")
+    assert_frame_equal(q.collect(), pl.DataFrame({"b": [2, 3]}))
+    assert q._ldf._retained_parquet_metadata_columns() == [[(0, 2)]]
+
+    q = lf.select("c")
+    assert_frame_equal(
+        q.collect(), pl.DataFrame({"c": [None, None, None]}, schema={"c": pl.Int64})
+    )
+    assert q._ldf._retained_parquet_metadata_columns() == [[(0, 0)]]
+
+    assert lf.select(pl.len()).collect().item() == 3
+
+
+@pytest.mark.write_disk
 def test_scan_iceberg_files_without_field_ids_are_unaffected_by_metadata_pruning(
     tmp_path: Path, plmonkeypatch: PlMonkeyPatch
 ) -> None:
@@ -10726,7 +10773,9 @@ def test_scan_iceberg_files_without_field_ids_are_unaffected_by_metadata_pruning
     )
     path = tmp_path / "no-field-ids.parquet"
     pq.write_table(
-        pa.table({"a": pa.array([1, 2], pa.int64()), "b": pa.array([3, 4], pa.int64())}),
+        pa.table(
+            {"a": pa.array([1, 2], pa.int64()), "b": pa.array([3, 4], pa.int64())}
+        ),
         path,
     )
     tbl.add_files([format_file_uri_iceberg(path)])
