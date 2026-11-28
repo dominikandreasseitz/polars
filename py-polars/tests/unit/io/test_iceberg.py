@@ -8566,9 +8566,12 @@ def test_scan_iceberg_renamed_column_with_pruned_metadata(
         PyLazyFrame.new_from_dataset_object(
             new_iceberg_scan_resolver(tbl), resolve_heavy_sources=4
         )
-    )
+    ).select("new")
 
-    assert lf.select("new").collect().to_series().to_list() == [1, 2, 3]
+    assert lf.collect().to_series().to_list() == [1, 2, 3]
+    # Pruning must actually engage here, not just preserve correctness: 1 of 2
+    # columns' metadata kept.
+    assert lf._ldf._retained_parquet_metadata_columns() == [[(0, 1)]]
 
 
 def _count_opens(
@@ -10705,6 +10708,95 @@ def test_scan_iceberg_files_without_field_ids_use_name_mapping(
     lf = pl.scan_iceberg(tbl)
     assert_frame_equal(lf.collect(), expect)
     assert_frame_equal(lf.filter(pl.col("b") == 2).collect(), expect.tail(1))
+
+
+@pytest.mark.write_disk
+def test_scan_iceberg_pruned_metadata_by_field_id(
+    tmp_path: Path, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # Swapped renames, a predicate, and a column added later.
+    tbl, catalog = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "a", LongType()),
+            NestedField(2, "b", LongType()),
+            NestedField(3, "d", LongType()),
+        ),
+    )
+    pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "d": [7, 8, 9]}).write_iceberg(
+        tbl, mode="append"
+    )
+    for old, new in [("a", "tmp"), ("b", "a"), ("tmp", "b")]:
+        with tbl.update_schema() as update:
+            update.rename_column(old, new)
+    with tbl.update_schema() as update:
+        update.add_column("c", LongType())
+    tbl = catalog.load_table(tbl.name())
+
+    plmonkeypatch.setenv("POLARS_PRUNE_PARQUET_METADATA", "1")
+
+    from polars._plr import PyLazyFrame
+    from polars._utils.wrap import wrap_ldf
+
+    lf = wrap_ldf(
+        PyLazyFrame.new_from_dataset_object(
+            new_iceberg_scan_resolver(tbl), resolve_heavy_sources=4
+        )
+    )
+
+    q = lf.filter(pl.col("a") > 4).select("b")
+    assert_frame_equal(q.collect(), pl.DataFrame({"b": [2, 3]}))
+    assert q._ldf._retained_parquet_metadata_columns() == [[(0, 2)]]
+
+    q = lf.select("c")
+    assert_frame_equal(
+        q.collect(), pl.DataFrame({"c": [None, None, None]}, schema={"c": pl.Int64})
+    )
+    assert q._ldf._retained_parquet_metadata_columns() == [[(0, 0)]]
+
+    assert lf.select(pl.len()).collect().item() == 3
+
+
+@pytest.mark.write_disk
+def test_scan_iceberg_files_without_field_ids_are_unaffected_by_metadata_pruning(
+    tmp_path: Path, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # Files without Parquet field IDs (e.g. added via `add_files`) are matched by
+    # name mapping, not field ID - metadata pruning can't resolve them by ID and must
+    # leave their footer metadata untouched rather than prune it away to nothing.
+    tbl, catalog = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "a", LongType()),
+            NestedField(2, "b", LongType()),
+        ),
+    )
+    path = tmp_path / "no-field-ids.parquet"
+    pq.write_table(
+        pa.table(
+            {"a": pa.array([1, 2], pa.int64()), "b": pa.array([3, 4], pa.int64())}
+        ),
+        path,
+    )
+    tbl.add_files([format_file_uri_iceberg(path)])
+    with tbl.update_schema() as update:
+        update.rename_column("a", "renamed")
+    tbl = catalog.load_table(tbl.name())
+
+    plmonkeypatch.setenv("POLARS_PRUNE_PARQUET_METADATA", "1")
+
+    from polars._plr import PyLazyFrame
+    from polars._utils.wrap import wrap_ldf
+
+    lf = wrap_ldf(
+        PyLazyFrame.new_from_dataset_object(
+            new_iceberg_scan_resolver(tbl), resolve_heavy_sources=4
+        )
+    ).select("renamed")
+
+    assert_frame_equal(lf.collect(), pl.DataFrame({"renamed": [1, 2]}))
+    # Unprunable (no field IDs): metadata keeps both original columns, not just 1.
+    assert lf._ldf._retained_parquet_metadata_columns() == [[(0, 2)]]
 
 
 @pytest.mark.write_disk
